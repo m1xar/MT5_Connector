@@ -1,0 +1,12 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+sqlmodel==0.0.22
+sqlalchemy==2.0.35
+psycopg[binary]>=3.2.10
+greenlet>=3.0.0
+pydantic>=2.9.2
+pydantic-settings>=2.5.2
+python-dotenv>=1.0.1
+
+# Windows only - the terminal workers cannot run anywhere else.
+MetaTrader5>=5.0.45; sys_platform == "win32"
