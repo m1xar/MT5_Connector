@@ -32,6 +32,15 @@ ResultHandler = Callable[[SyncResult], Awaitable[None]]
 # second look; a rejected login is not.
 _DEFINITIVE_ERROR_CODES = frozenset({-6})
 
+# Shutdown waits for in-flight tasks so none of them writes to a disposed
+# engine, but it cannot wait for ever: a task parked in a blocking pipe read
+# lives in a thread, and threads do not cancel.
+_SHUTDOWN_DRAIN_SECONDS = 30.0
+
+# How often a worker that failed - at startup, or in the pool's own code -
+# is offered another chance. Without this the pool only ever shrinks.
+_REAP_INTERVAL_SECONDS = 60.0
+
 
 @dataclass
 class _QueuedTask:
@@ -96,6 +105,7 @@ class PoolManager:
         self._idle: asyncio.Queue[WorkerHandle] = asyncio.Queue()
         self._sequence = count()
         self._dispatcher: asyncio.Task | None = None
+        self._reaper: asyncio.Task | None = None
         # Strong references to in-flight _execute tasks: without them the
         # event loop is free to collect a task mid-run.
         self._running: set[asyncio.Task] = set()
@@ -130,6 +140,7 @@ class PoolManager:
                 self._idle.put_nowait(worker)
 
         self._dispatcher = asyncio.create_task(self._dispatch_loop(), name="pool-dispatcher")
+        self._reaper = asyncio.create_task(self._reap_loop(), name="pool-reaper")
         log_event(
             logger, "info", "pool.started",
             workers=len(self._workers),
@@ -138,13 +149,15 @@ class PoolManager:
 
     async def stop(self) -> None:
         self._closing = True
-        if self._dispatcher is not None:
-            self._dispatcher.cancel()
+        for task in (self._dispatcher, self._reaper):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._dispatcher
+                await task
             except asyncio.CancelledError:
                 pass
-            self._dispatcher = None
+        self._dispatcher = self._reaper = None
 
         for worker in self._workers:
             await worker.terminate()
@@ -154,7 +167,17 @@ class PoolManager:
         # the engine is disposed. Terminating the workers has already broken
         # their pipes, so they resolve quickly.
         if self._running:
-            await asyncio.gather(*list(self._running), return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*list(self._running), return_exceptions=True),
+                    timeout=_SHUTDOWN_DRAIN_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                log_event(
+                    logger, "warning", "pool.stop.drain_timeout",
+                    pending=len(self._running),
+                    timeout_seconds=_SHUTDOWN_DRAIN_SECONDS,
+                )
 
         while not self._queue.empty():
             _, _, item = self._queue.get_nowait()
@@ -243,6 +266,43 @@ class PoolManager:
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 await asyncio.sleep(1.0)
+
+    async def _reap_loop(self) -> None:
+        """Give failed workers another go, so the pool can only grow back.
+
+        A worker fails for two reasons that nothing else recovers from: its
+        terminal was unreachable when the pool started, or the pool's own
+        code raised while it held the worker. Either way the dispatcher has
+        already taken it out of the idle queue and nothing puts it back, so
+        without this the pool only ever shrinks - quietly, since every
+        remaining worker still reports itself healthy.
+        """
+        while not self._closing:
+            try:
+                await asyncio.sleep(_REAP_INTERVAL_SECONDS)
+                for worker in self._workers:
+                    if self._closing:
+                        return
+                    if worker.state is not WorkerState.failed:
+                        continue
+                    log_event(
+                        logger, "info", "pool.worker.reaping",
+                        worker_id=worker.worker_id, error=worker.last_error,
+                    )
+                    if await worker.restart():
+                        worker.state = WorkerState.idle
+                        self._idle.put_nowait(worker)
+                        log_event(
+                            logger, "info", "pool.worker.recovered",
+                            worker_id=worker.worker_id,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log_event(
+                    logger, "error", "pool.reap.failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
 
     async def _execute(self, worker: WorkerHandle, item: _QueuedTask) -> None:
         """Run one task to a conclusion, whatever happens.

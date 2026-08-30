@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from domain import fx
 
-from ..helpers.timeutil import cutoff_from_days, is_after_cutoff, to_real_utc
+from ..clock import ServerClock
+from ..helpers.timeutil import cutoff_from_days, is_after_cutoff
 
 
 def build_balance_snapshots(
     positions: list[fx.FXPosition],
     days: int | None = None,
-    server_offset_minutes: int | None = None,
+    clock: ServerClock | None = None,
 ) -> list[fx.UserBalanceSnapshot]:
     """The account balance over time, derived rather than stored.
 
@@ -16,6 +17,7 @@ def build_balance_snapshots(
     each close. `days` trims the result rather than the input: the series has to
     be built from every position, or the first point would start mid-history.
     """
+    clock = clock or ServerClock()
     closed = sorted(
         positions,
         key=lambda position: (position.closed_at is None, position.closed_at),
@@ -26,14 +28,14 @@ def build_balance_snapshots(
     snapshots = [
         fx.UserBalanceSnapshot(
             created_at=closed[0].created_at,
-            created_at_utc=to_real_utc(closed[0].created_at, server_offset_minutes),
+            created_at_utc=clock.to_utc(closed[0].created_at),
             balance=closed[0].balance_init,
         )
     ]
     snapshots += [
         fx.UserBalanceSnapshot(
             created_at=position.closed_at,
-            created_at_utc=to_real_utc(position.closed_at, server_offset_minutes),
+            created_at_utc=clock.to_utc(position.closed_at),
             balance=round(position.balance_init + position.net_pnl, 8),
         )
         for position in closed

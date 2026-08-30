@@ -11,6 +11,8 @@ from schemas.sync import (
     PositionListResponse,
     TransactionListResponse,
 )
+from domain.models import MT5Account
+from mt5api.clock import ServerClock
 from services.query_service import QueryService
 
 from ..auth import verify_auth
@@ -19,6 +21,11 @@ from ..runtime import COMMON_RESPONSES, get_session, load_account
 router = APIRouter(tags=["Data"], responses=COMMON_RESPONSES)
 
 _DAYS = Query(default=0, ge=0, description="Window in days; 0 means everything")
+
+
+def _clock(account: MT5Account) -> ServerClock:
+    """The trade server's clock as this account last measured it."""
+    return ServerClock(offset_minutes=account.server_utc_offset_minutes)
 
 
 @router.get(
@@ -41,7 +48,7 @@ async def get_positions(
         days=days,
         limit=limit,
         offset=offset,
-        server_offset_minutes=account.server_utc_offset_minutes,
+        clock=_clock(account),
     )
     return PositionListResponse(
         account_id=account_id, count=len(positions), positions=positions
@@ -61,7 +68,7 @@ async def get_open_positions(
 ):
     account = await load_account(session, account_id)
     open_positions = await QueryService(session).open_positions(
-        account_id, server_offset_minutes=account.server_utc_offset_minutes
+        account_id, clock=_clock(account)
     )
     return OpenPositionListResponse(
         account_id=account_id, count=len(open_positions), open_positions=open_positions
@@ -87,7 +94,7 @@ async def get_balance_snapshots(
     snapshots = await QueryService(session).balance_snapshots(
         account_id,
         days=days,
-        server_offset_minutes=account.server_utc_offset_minutes,
+        clock=_clock(account),
     )
     return BalanceSnapshotListResponse(
         account_id=account_id, count=len(snapshots), snapshots=snapshots
@@ -113,7 +120,7 @@ async def get_transactions(
         days=days,
         limit=limit,
         offset=offset,
-        server_offset_minutes=account.server_utc_offset_minutes,
+        clock=_clock(account),
     )
     return TransactionListResponse(
         account_id=account_id, count=len(transactions), transactions=transactions

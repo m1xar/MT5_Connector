@@ -28,6 +28,21 @@ def history_range(days: int | None) -> tuple[datetime, datetime]:
     return start, end
 
 
+def as_server_time(value: datetime | None) -> datetime | None:
+    """A server-clock timestamp, without a timezone it does not have.
+
+    MT5 stamps every time it hands out in the trade server's clock, and the
+    package presents them as if they were UTC epochs. Carrying that marker
+    through to the API would claim UTC for something that is not, and a
+    consumer parsing it would be wrong by the offset - more confidently than
+    before, because the field looks authoritative. The `*Utc` twin carries the
+    marker instead, having earned it.
+    """
+    if value is None:
+        return None
+    return value.replace(tzinfo=None)
+
+
 def to_real_utc(value: datetime | None, offset_minutes: int | None) -> datetime | None:
     """The same instant with the trade server's offset taken off.
 

@@ -131,7 +131,7 @@ mt5api/
   terminal.py       the only module that imports MetaTrader5
   executors.py      account, deals, orders, positions - and waiting for history
   candles.py        candle windows, with the clock skew and the stray bars
-  clock.py          how far the trade server's clock runs from real UTC
+  clock.py          the server's UTC offset, read off the trading week
   payload.py        one terminal read -> SyncPayload
   enrichment.py     MAE/MFE across a set of positions
   builders/         deals -> FX models (ported from Go); enrich.py has MAE/MFE and RR
@@ -240,29 +240,68 @@ That is internally consistent, so every calculation is right: deals, positions
 and candles all live in the same scale. It is only wrong at the edges, where a
 consumer reasonably assumes UTC.
 
-So the offset is measured and reported rather than guessed at. `mt5api/clock.py`
-compares a live tick against real UTC and rounds to the half hour; the result is
+So the offset is measured and reported rather than guessed at. The result is
 stored on the account as `server_utc_offset_minutes` and shown in
 `GET /accounts/{id}` and `/accounts/{id}/info`. Timestamps then come back in
 pairs — `ClosedAt` is what the terminal itself would show, `ClosedAtUtc` is the
 same instant in real UTC:
 
 ```json
-{ "ClosedAt": "2025-03-14T15:30:00", "ClosedAtUtc": "2025-03-14T12:30:00" }
+{ "ClosedAt": "2025-03-14T15:30:00", "ClosedAtUtc": "2025-03-14T12:30:00Z" }
 ```
 
-Three things to know about it:
+Only the `*Utc` twin carries a `Z`. The unsuffixed field deliberately does not:
+it is the server's own clock, and labelling it UTC would be a lie that survives
+all the way to a consumer, who would parse it confidently and be wrong by the
+offset. `raw.py` therefore strips the marker MT5 implies rather than passing it
+on.
 
-* **It can only be measured while the market quotes.** Over a weekend the last
-  tick is days old, which would read as an offset of tens of hours, so anything
-  beyond what a real trade server could be is discarded as unknown. A sync that
-  cannot measure it keeps the last value rather than clearing it.
-* **`*Utc` is null when the offset is unknown**, which is a better answer than a
-  wrong one.
-* **Historical positions use today's offset.** Brokers mostly sit on EET/EEST
-  and switch on their own schedule, so a position on the far side of a daylight
-  saving change is off by an hour. Fixing that properly needs the broker's DST
-  calendar, which MT5 does not expose.
+### Measuring it off the week, not the clock
+
+There is no clock to read. `terminal_info` and `account_info` carry no time at
+all; the only timestamp the API exposes outside of history is the last quote's,
+and that is the wrong thing to measure against. Quotes stop at the weekend, and
+a tick left over from Friday does not look broken — for the next fourteen hours
+it reads as a perfectly plausible offset, drifting an hour further out with
+every hour that passes. Since the scheduler syncs every fifteen minutes, every
+weekend would walk straight through that window and store the result.
+
+`mt5api/clock.py` uses the trading week instead. Forex opens and closes at 17:00
+in New York, which is a known instant in real UTC for any date — New York's own
+daylight saving is in the zone database. The same boundary appears in the bar
+labels as the two edges of the weekend gap, stamped in the server's clock. The
+difference between them is the offset.
+
+Bars are pulled **by position**, so no date is ever sent to the terminal and
+nothing can be shifted on the way in. Both edges of each gap are sampled, which
+cancels out a broker that stops quoting early and resumes late, and several
+weeks are reduced by median so one holiday cannot decide the answer. Measured on
+two brokers, eight weekends each: every single reading agreed, and it works with
+the market shut, which is exactly when the old approach was least trustworthy.
+
+### Daylight saving, still open
+
+Brokers move with daylight saving on their own schedule, so a position from the
+far side of a switch wants the offset that was in force *then*, not today's.
+Today's is what it gets, so such a position is an hour out.
+
+Reading the switches off the same weekend boundaries was tried and dropped. The
+step is easy — an hour, clearly visible in hourly bars, which reach back years
+where minute bars reach back weeks. The *dates* are not. The anchor is 17:00 in
+New York, and New York keeps its own daylight saving on the American calendar,
+a fortnight away from the European one. Whether a broker's week-open follows
+the New York session or its own local midnight decides which of the two
+calendars the measurement picks up, and that differs by broker: of two tested,
+one produced the European rule and the other the American one, from identical
+code against identical-looking data. A rule that is confidently wrong for half
+the brokers is worse than no rule, because it moves timestamps in the wrong
+direction rather than leaving them honestly approximate.
+
+Doing it properly needs the broker's own schedule, which MT5 does not expose.
+
+**`*Utc` is null when the offset cannot be measured**, which is a better answer
+than a wrong one. That now means a symbol with under a couple of months of
+minute history, rather than "it is Saturday".
 
 The stored value is never rewritten: converting is a read-side concern, exactly
 like the `days` window.
@@ -332,9 +371,9 @@ times it returns line up with deal times: against a UTC+3 server, asking for
 for leaves only the overlap, which is *empty* for any position shorter than the
 offset - it left 61 of one account's 91 positions with no candles and quietly
 truncated the rest. `fetch_candles` widens the request by the server's measured
-offset plus a two-hour margin and trims by bar time. When the offset is unknown
-- it can only be measured off a live tick, so not at the weekend - the request
-falls back to a slack wider than any real trade server.
+offset plus a two-hour margin and trims by bar time. When the offset could not
+be measured the request falls back to a slack wider than any real trade
+server.
 
 **`copy_rates_range` does not report "nothing here" as empty.** Asked for three
 hours in 2022 on a symbol whose minute history reaches back 70 days, it returns

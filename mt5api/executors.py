@@ -4,7 +4,7 @@ import time
 
 from utils.logging import get_logger, log_event
 
-from .clock import measure_server_offset
+from .clock import measure_server_clock
 from .helpers.timeutil import as_naive_utc, history_range
 from .raw import RawAccount, RawDeal, RawHistory, RawOrder, RawPosition
 from .terminal import MT5Terminal, TerminalError
@@ -134,9 +134,12 @@ def fetch_history(
     open_positions = fetch_open_positions(terminal)
     # Measured from the symbols this account actually trades, so a broker
     # carrying none of the usual majors still gets an answer.
-    server_offset = measure_server_offset(
-        terminal, symbols=[deal.symbol for deal in reversed(deals) if deal.symbol][:4]
-    )
+    # Measured from the symbols this account actually trades, so a broker
+    # carrying none of the usual majors still gets an answer.
+    server_offset = measure_server_clock(
+        terminal,
+        symbols=[deal.symbol for deal in reversed(deals) if deal.symbol][:4],
+    ).offset_minutes
     open_orders = fetch_open_orders(terminal)
 
     log_event(

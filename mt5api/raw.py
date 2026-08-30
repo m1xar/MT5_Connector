@@ -82,10 +82,18 @@ def _get(source: Any, name: str, default: Any = None) -> Any:
 
 
 def _dt_from_msc(msc: int | None, seconds: int | None) -> datetime | None:
+    """A timestamp in the trade server's clock, left unlabelled.
+
+    MT5 hands these out as if they were UTC epochs, but they are stamped in the
+    server's own clock. Marking them UTC would be a lie that survives all the
+    way to the API, where a consumer would parse it confidently and be wrong by
+    the offset. The `*Utc` twin is derived on the way out, once the offset is
+    known, and carries the marker it has earned.
+    """
     if msc:
-        return datetime.fromtimestamp(int(msc) / 1000.0, tz=timezone.utc)
+        return datetime.fromtimestamp(int(msc) / 1000.0, tz=timezone.utc).replace(tzinfo=None)
     if seconds:
-        return datetime.fromtimestamp(int(seconds), tz=timezone.utc)
+        return datetime.fromtimestamp(int(seconds), tz=timezone.utc).replace(tzinfo=None)
     return None
 
 

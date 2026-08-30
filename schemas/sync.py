@@ -9,7 +9,6 @@ from domain.enums import SyncStatus
 
 
 class SyncQueuedResponse(BaseModel):
-    sync_run_id: str
     account_id: str
     status: SyncStatus
     queue_depth: int
@@ -17,7 +16,6 @@ class SyncQueuedResponse(BaseModel):
 
 class SyncResultResponse(BaseModel):
 
-    sync_run_id: Optional[str]
     account_id: str
     ok: bool
     error: Optional[str] = None
