@@ -5,6 +5,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+from domain.enums import SyncKind
 from domain.payload import SyncPayload
 
 PRIORITY_HARD = 0
@@ -28,6 +29,12 @@ class SyncTask:
     login: int
     password: str
     server: str
+    # Why this sync was asked for. It travels with the task rather than being
+    # looked up later, because only the parent can see the database and the
+    # result has to be judged without a second query.
+    kind: SyncKind = SyncKind.scheduled
+    # Correlation id shared by every log line of this sync, on both sides of
+    # the pipe. Nothing stores it.
     sync_run_id: Optional[str] = None
     # Overrides the worker default; the first sync of a new account gets a
     # longer one because that connection has never been proven to work.
@@ -35,6 +42,9 @@ class SyncTask:
     # Positions whose MAE/MFE is already stored; the worker skips pricing
     # them rather than re-fetching candles from years ago.
     already_measured: frozenset = frozenset()
+    # The offset measured on the last successful sync. Used only as a fallback:
+    # the worker measures its own, and cannot while the market is shut.
+    server_offset_minutes: Optional[int] = None
 
 
 @dataclass(slots=True)
@@ -48,6 +58,7 @@ class SyncResult:
     duration_ms: int = 0
     worker_id: Optional[str] = None
     sync_run_id: Optional[str] = None
+    kind: SyncKind = SyncKind.scheduled
 
 
 @dataclass(slots=True)

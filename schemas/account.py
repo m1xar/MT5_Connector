@@ -34,6 +34,7 @@ class AccountResponse(BaseModel):
     enabled: bool
     status: AccountStatus
     consecutive_failures: int
+    server_utc_offset_minutes: Optional[int]
     balance: float
     equity: float
     leverage: int
@@ -59,6 +60,7 @@ def account_to_response(account: MT5Account) -> AccountResponse:
         enabled=account.enabled,
         status=account.status,
         consecutive_failures=account.consecutive_failures,
+        server_utc_offset_minutes=account.server_utc_offset_minutes,
         balance=account.balance,
         equity=account.equity,
         leverage=account.leverage,

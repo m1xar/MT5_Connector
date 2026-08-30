@@ -69,7 +69,7 @@ async def create_account(
 
     # Nothing about this account has been proven yet, so prove it now: the
     # initial sync jumps the queue on a longer connect timeout.
-    _, future = await service.request(
+    _sync_run_id, future = await service.request(
         session,
         account,
         SyncKind.initial,

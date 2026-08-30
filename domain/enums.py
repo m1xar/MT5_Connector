@@ -22,7 +22,10 @@ class SyncKind(str, Enum):
 
 
 class SyncStatus(str, Enum):
+    """Reported in the 202 of a fire-and-forget sync. Nothing stores it.
+
+    A sync is either in flight - the pool knows about it, and /pool/status
+    shows it - or finished, and then its outcome lives on the account.
+    """
+
     queued = "queued"
-    running = "running"
-    completed = "completed"
-    failed = "failed"

@@ -29,7 +29,11 @@ async def get_pool_status(
     "/healthz",
     response_model=HealthResponse,
     summary="Liveness",
-    description="Public. `degraded` means at least one terminal is not usable.",
+    description=(
+        "Public. `degraded` means at least one terminal is not usable; "
+        "`stalled` means the dispatcher has stopped, so nothing will be "
+        "synced at all no matter how healthy the terminals look."
+    ),
 )
 async def healthz(request: Request):
     pool: PoolManager | None = getattr(request.app.state, "pool", None)
@@ -37,8 +41,14 @@ async def healthz(request: Request):
         return HealthResponse(status="starting", healthy_workers=0, worker_count=0)
     workers = pool.status().workers
     healthy = pool.healthy_workers
+    if not pool.dispatcher_alive:
+        status = "stalled"
+    elif healthy == len(workers):
+        status = "ok"
+    else:
+        status = "degraded"
     return HealthResponse(
-        status="ok" if healthy == len(workers) else "degraded",
+        status=status,
         healthy_workers=healthy,
         worker_count=len(workers),
     )

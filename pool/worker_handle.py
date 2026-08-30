@@ -46,16 +46,24 @@ class WorkerHandle:
     last_error: Optional[str] = None
 
     async def spawn(self) -> bool:
-        parent_conn, child_conn = self.mp_context.Pipe()
-        process = self.mp_context.Process(
-            target=self.target,
-            args=(self.worker_id, self.terminal_path, child_conn),
-            kwargs=self.worker_kwargs,
-            daemon=True,
-            name=f"mt5-worker-{self.worker_id}",
-        )
-        process.start()
-        child_conn.close()
+        # Starting a process can fail outright - the OS refuses, or the target
+        # will not pickle. Reported like any other failed start, because the
+        # caller is a restart ladder that has to keep its footing.
+        try:
+            parent_conn, child_conn = self.mp_context.Pipe()
+            process = self.mp_context.Process(
+                target=self.target,
+                args=(self.worker_id, self.terminal_path, child_conn),
+                kwargs=self.worker_kwargs,
+                daemon=True,
+                name=f"mt5-worker-{self.worker_id}",
+            )
+            process.start()
+            child_conn.close()
+        except Exception as exc:
+            return await self._start_failed(
+                f"worker would not spawn: {type(exc).__name__}: {exc}"
+            )
 
         self.process = process
         self.connection = parent_conn
@@ -124,8 +132,14 @@ class WorkerHandle:
             )
 
     async def roundtrip(self, task: SyncTask) -> SyncResult:
-        await asyncio.to_thread(self.connection.send, task)
-        return await asyncio.to_thread(self.connection.recv)
+        # A handle torn down between dispatch and here has no pipe. Saying so
+        # as a ConnectionError puts it in the same bucket as any other lost
+        # worker, instead of an AttributeError nobody catches.
+        connection = self.connection
+        if connection is None:
+            raise ConnectionError(f"worker {self.worker_id} has no open pipe")
+        await asyncio.to_thread(connection.send, task)
+        return await asyncio.to_thread(connection.recv)
 
     def claim(self, task: SyncTask) -> None:
         self.state = WorkerState.busy

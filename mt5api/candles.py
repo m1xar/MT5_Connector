@@ -13,9 +13,20 @@ logger = get_logger(__name__)
 
 _TIMEFRAMES = {"1m": TIMEFRAME_M1, "1d": TIMEFRAME_D1}
 
+# Used when the server's offset could not be measured - over a weekend, say.
 # Wider than any real trade server is from UTC, so the requested window is
 # always inside what comes back whichever way the server's clock leans.
-_REQUEST_SLACK = timedelta(hours=15)
+_BLIND_SLACK = timedelta(hours=15)
+
+# Added on top of a measured offset: an hour for the broker's own daylight
+# saving switch, which does not follow ours, plus room for bar alignment.
+_MEASURED_MARGIN = timedelta(hours=2)
+
+
+def _slack(server_offset_minutes: int | None) -> timedelta:
+    if server_offset_minutes is None:
+        return _BLIND_SLACK
+    return timedelta(minutes=abs(server_offset_minutes)) + _MEASURED_MARGIN
 
 
 def fetch_candles(
@@ -24,6 +35,7 @@ def fetch_candles(
     interval: str,
     start: datetime,
     end: datetime,
+    server_offset_minutes: int | None = None,
 ) -> list[RawCandle]:
     """Candles inside [start, end], and nothing else.
 
@@ -34,11 +46,15 @@ def fetch_candles(
     UTC+3 server, asking for 12:00-14:00 hands back bars stamped 09:00-11:00.
     Filtering that to the requested window leaves only the overlap, which is
     empty for any position shorter than the offset - 61 of one account's 91
-    positions came back with no candles at all for exactly that reason. Rather
-    than calibrate an offset per broker (and re-calibrate it twice a year for
-    daylight saving), the request is widened by more than any real offset and
-    the answer trimmed by bar time, which has been verified against deal times:
-    the bar holding a deal's entry price sits within a minute of the deal.
+    positions came back with no candles at all for exactly that reason.
+
+    So the request is widened by the server's measured offset plus a margin,
+    and the answer trimmed by bar time - which has been verified against deal
+    times: the bar holding a deal's entry price sits within a minute of the
+    deal. Trimming stays even though the offset is now known, because the
+    offset is measured from a live tick and cannot be measured at all while
+    the market is shut; when it is unknown the request falls back to a slack
+    wider than any real trade server.
 
     And `copy_rates_range` does not report "nothing for that range" as an empty
     result. Asked for three hours in 2022 on a symbol whose minute history only
@@ -51,12 +67,13 @@ def fetch_candles(
     timeframe = _TIMEFRAMES[interval]
     terminal.mt5.symbol_select(symbol, True)
     window_start, window_end = as_naive_utc(start), as_naive_utc(end)
+    slack = _slack(server_offset_minutes)
     rows = terminal.check_call(
         terminal.mt5.copy_rates_range(
             symbol,
             timeframe,
-            window_start - _REQUEST_SLACK,
-            window_end + _REQUEST_SLACK,
+            window_start - slack,
+            window_end + slack,
         ),
         "copy_rates_range",
     )
@@ -77,6 +94,7 @@ def fetch_candles(
             interval=interval,
             window_start=window_start.isoformat(),
             window_end=window_end.isoformat(),
+            slack_minutes=int(slack.total_seconds() // 60),
             returned=len(candles),
             kept=len(inside),
         )

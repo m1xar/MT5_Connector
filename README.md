@@ -25,9 +25,13 @@ FastAPI parent (asyncio)          -> Postgres (all normal reads)
  └─ scheduler                     re-queues accounts older than the interval
 
 worker process
-  mt5.initialize(path=…) once at start
-  loop: recv task -> mt5.login(...) -> executors -> builders -> send models
+  loop: recv task -> terminal.connect(...) -> executors -> builders -> send models
 ```
+
+The terminal is *not* started when the worker is. It cannot be: `initialize()`
+without credentials leaves the terminal sitting on its account wizard, where it
+never answers the IPC channel. It comes up on the first task that supplies a
+login, and later tasks switch accounts with `login()`.
 
 The queue lives in the parent because a `multiprocessing.Queue` has no priority
 and a hard sync has to jump the line. Children only ever report "I am free".
@@ -52,6 +56,14 @@ so these pydantic models keep snake_case attributes but serialize by alias to
 | `UserBalanceSnapshot` | derived from positions, never stored |
 | `MAE` / `MFE` | candles the position lived through |
 | `RR` / `RRPlanned` | entry, stop loss, take profit — no candles involved |
+| `*Utc` timestamps | the unsuffixed field minus the trade server's offset |
+
+Four tables are stored: accounts, closed positions, open positions and
+transactions. Sync runs are deliberately not one of them — a sync is either in
+flight, and then `/pool/status` knows about it, or finished, and then its
+outcome is on the account (`last_synced_at`, `status`, `consecutive_failures`,
+`last_error`). The `sync_run_id` in a response is a correlation id for the
+logs, not a row.
 
 ### BalanceInit, the one real difference from cTrader
 
@@ -119,6 +131,7 @@ mt5api/
   terminal.py       the only module that imports MetaTrader5
   executors.py      account, deals, orders, positions - and waiting for history
   candles.py        candle windows, with the clock skew and the stray bars
+  clock.py          how far the trade server's clock runs from real UTC
   payload.py        one terminal read -> SyncPayload
   enrichment.py     MAE/MFE across a set of positions
   builders/         deals -> FX models (ported from Go); enrich.py has MAE/MFE and RR
@@ -129,6 +142,8 @@ domain/             fx.py (canonical models), models.py (tables), enums.py
 repositories/       queries and flush, no commits
 services/           transaction boundaries: account, sync, query
 utils/              config, logging, hashing, ids
+
+deploy/             open-master, clone, prune-history, install-prune-task
 ```
 
 ## Endpoints
@@ -145,9 +160,12 @@ utils/              config, logging, hashing, ids
 | GET | `/accounts/{id}/transactions?days=N` | deposits/withdrawals |
 | GET | `/accounts/{id}/info` | balance, leverage, currency |
 | GET | `/pool/status` | per-worker state, queue depth |
-| GET | `/healthz` | public liveness |
+| GET | `/healthz` | public liveness: `ok`, `degraded`, `stalled` |
 
-`days=0` means "everything". Every route except `/healthz` takes a single
+`days=0` means "everything". `/healthz` reports `degraded` when a terminal is
+unusable and `stalled` when the dispatcher has stopped — the second one matters
+because every worker can look perfectly healthy while nothing is being handed
+to them. Every route except `/healthz` takes a single
 bearer token (`MT5_API_API_TOKEN`) in `Authorization: Bearer ...`; leaving the
 setting empty disables auth entirely, which is only acceptable on a closed
 network.
@@ -170,7 +188,7 @@ An account flips to `error_connection` when either:
 * **three consecutive syncs fail** (`MT5_API_ACCOUNT_ERROR_THRESHOLD`), or
 * **its very first sync fails.** Registering an account queues an *initial*
   sync ahead of everything else in the pool, with a longer connect timeout
-  (`MT5_API_TERMINAL_INITIAL_CONNECT_TIMEOUT_MS`, 60s) than a routine one.
+  (`MT5_API_TERMINAL_INITIAL_CONNECT_TIMEOUT_MS`, 120s) than a routine one.
   There is no run of successes for that failure to be a blip in, so one strike
   is conclusive. `POST /accounts?wait=true` blocks on it and returns the
   settled status.
@@ -181,6 +199,73 @@ tick, and one wrong server name would otherwise re-queue itself every 60s and
 occupy every worker for ~100s a time. They come back on an explicit
 `POST /accounts/{id}/sync`, or as soon as `PATCH /accounts/{id}` supplies a new
 password — new credentials clear the strikes and restore `active`.
+
+## When the pool goes wrong
+
+A sync pool has a failure mode worse than crashing: staying up and quietly
+doing nothing. Every guard below exists to make that impossible or, failing
+that, visible.
+
+**The dispatcher outlives its own bugs.** If the loop that hands tasks to idle
+workers dies, tasks pile up for ever while every worker still reports itself
+healthy. So its body is guarded and it keeps going, and `/healthz` reports it
+separately as `stalled` — a state no worker count can express.
+
+**A task always ends.** Anything thrown while running one is caught, the future
+is resolved, and the worker either returns to the idle queue or is marked
+failed. Before, only four exception types were handled; anything else removed a
+terminal from the pool without a word and left the caller waiting out its own
+timeout.
+
+**Failing to spawn is a normal outcome**, not an exception - the restart ladder
+has to keep its footing whether the process would not start or would not
+answer.
+
+**Nothing writes after shutdown.** In-flight tasks are tracked and awaited by
+`stop()`, so a result can no longer be persisted against a disposed engine.
+
+**Threads are sized to the pool.** Every in-flight sync parks one thread in a
+blocking pipe read for its whole duration, up to the task timeout. The default
+executor is `min(32, cpu_count + 4)` and shared with everything else in the
+process, so the pool sets its own rather than discovering the ceiling in
+production.
+
+## Time, and whose clock it is
+
+Every timestamp MT5 hands out - deal times, order times, bar times - is stamped
+in the **trade server's** clock while looking exactly like a UTC epoch. Nothing
+in the API tells you which clock that is.
+
+That is internally consistent, so every calculation is right: deals, positions
+and candles all live in the same scale. It is only wrong at the edges, where a
+consumer reasonably assumes UTC.
+
+So the offset is measured and reported rather than guessed at. `mt5api/clock.py`
+compares a live tick against real UTC and rounds to the half hour; the result is
+stored on the account as `server_utc_offset_minutes` and shown in
+`GET /accounts/{id}` and `/accounts/{id}/info`. Timestamps then come back in
+pairs — `ClosedAt` is what the terminal itself would show, `ClosedAtUtc` is the
+same instant in real UTC:
+
+```json
+{ "ClosedAt": "2025-03-14T15:30:00", "ClosedAtUtc": "2025-03-14T12:30:00" }
+```
+
+Three things to know about it:
+
+* **It can only be measured while the market quotes.** Over a weekend the last
+  tick is days old, which would read as an offset of tens of hours, so anything
+  beyond what a real trade server could be is discarded as unknown. A sync that
+  cannot measure it keeps the last value rather than clearing it.
+* **`*Utc` is null when the offset is unknown**, which is a better answer than a
+  wrong one.
+* **Historical positions use today's offset.** Brokers mostly sit on EET/EEST
+  and switch on their own schedule, so a position on the far side of a daylight
+  saving change is off by an hour. Fixing that properly needs the broker's DST
+  calendar, which MT5 does not expose.
+
+The stored value is never rewritten: converting is a read-side concern, exactly
+like the `days` window.
 
 ## What the terminal actually requires
 
@@ -213,7 +298,7 @@ the module, so that case takes the terminal down with it and the next task
 starts a fresh one; a rejected login leaves it usable.
 
 **Timeouts.** 30s for a routine connect, on a terminal that is already up and
-only switching accounts. 60s for the first sync of a newly added account, which
+only switching accounts. 120s for the first sync of a newly added account, which
 also has to start the terminal. Cold starts are the expensive case and they get
 more expensive in parallel — several terminals coming up at once on one box
 contend for the same CPU and the same server lookups — so if a whole pool
@@ -246,9 +331,10 @@ times it returns line up with deal times: against a UTC+3 server, asking for
 12:00-14:00 returns bars stamped 09:00-11:00. Trimming that to the window asked
 for leaves only the overlap, which is *empty* for any position shorter than the
 offset - it left 61 of one account's 91 positions with no candles and quietly
-truncated the rest. `fetch_candles` widens the request past any real server
-offset and trims by bar time, rather than calibrating a per-broker offset that
-would need re-deriving twice a year for daylight saving.
+truncated the rest. `fetch_candles` widens the request by the server's measured
+offset plus a two-hour margin and trims by bar time. When the offset is unknown
+- it can only be measured off a live tick, so not at the weekend - the request
+falls back to a slack wider than any real trade server.
 
 **`copy_rates_range` does not report "nothing here" as empty.** Asked for three
 hours in 2022 on a symbol whose minute history reaches back 70 days, it returns
@@ -398,17 +484,23 @@ there, an empty pool, and a missing token. Then check `GET /healthz` and
 
 ### 5. Housekeeping
 
-Schedule `deploy\prune-history.ps1 -Apply` hourly. Without it the price cache
-grows without limit — see *A minute window in the past is never cheap* above.
-Run without `-Apply` to see what it would reclaim.
+The price cache has to be pruned on a schedule. Without it it grows without
+limit — see *A minute window in the past is never cheap* above. One command
+registers it:
 
 ```powershell
-schtasks /Create /SC HOURLY /TN "MT5 prune history cache" /F ^
-  /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\path\to\deploy\prune-history.ps1 -Apply"
+# elevated PowerShell, from the repository
+.\deploy\install-prune-task.ps1 -IntervalMinutes 30 -Root D:\MT5
 ```
 
-It is safe against a live pool: files a terminal holds open are skipped, and
-anything still needed is re-downloaded on demand.
+That registers a SYSTEM task repeating every 30 minutes, starting at boot, and
+kicks off a first run so you can see it work. Verify with
+`Get-ScheduledTask -TaskName 'MT5 prune history cache' | Get-ScheduledTaskInfo`,
+undo with `-Remove`.
+
+Run `deploy\prune-history.ps1` by hand without `-Apply` to see what it would
+reclaim. It is safe against a live pool: files a terminal holds open are
+skipped, and anything still needed is re-downloaded on demand.
 
 ### What it costs
 
@@ -442,3 +534,8 @@ is the reconstruction itself, which needs an account with real trading history:
    busy, the queue draining, and a hard sync fired mid-way coming back first.
 4. Kill one `terminal64.exe` mid-sync — the service should restart that worker
    and finish the task.
+5. Check the clock: `GET /accounts/{id}/info` should report a
+   `server_utc_offset_minutes` that matches the terminal's own Market Watch
+   time, and `ClosedAtUtc` on a position should be that many minutes behind
+   `ClosedAt`. Measured off a live tick, so do this while the market is open —
+   at the weekend it stays at whatever the last weekday sync recorded.

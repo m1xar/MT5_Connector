@@ -10,6 +10,8 @@ from typing import Any, Awaitable, Callable
 from utils.id import new_id
 from utils.logging import get_logger, log_event
 
+from domain.enums import SyncKind
+
 from .protocol import (
     PRIORITY_HARD,
     PRIORITY_SCHEDULED,
@@ -94,8 +96,14 @@ class PoolManager:
         self._idle: asyncio.Queue[WorkerHandle] = asyncio.Queue()
         self._sequence = count()
         self._dispatcher: asyncio.Task | None = None
+        # Strong references to in-flight _execute tasks: without them the
+        # event loop is free to collect a task mid-run.
+        self._running: set[asyncio.Task] = set()
         self._in_flight: dict[str, _QueuedTask] = {}
-        self._pending_accounts: dict[str, "asyncio.Future[SyncResult]"] = {}
+        # account_id -> (sync_run_id, future) of the sync currently in flight.
+        self._pending_accounts: dict[
+            str, tuple[str | None, "asyncio.Future[SyncResult]"]
+        ] = {}
         self._closing = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -142,6 +150,12 @@ class PoolManager:
             await worker.terminate()
             worker.state = WorkerState.stopped
 
+        # Tasks still mid-flight would otherwise write to the database after
+        # the engine is disposed. Terminating the workers has already broken
+        # their pipes, so they resolve quickly.
+        if self._running:
+            await asyncio.gather(*list(self._running), return_exceptions=True)
+
         while not self._queue.empty():
             _, _, item = self._queue.get_nowait()
             self._resolve(item, self._failure(item, "pool is shutting down"))
@@ -157,15 +171,13 @@ class PoolManager:
         server: str,
         *,
         priority: int = PRIORITY_SCHEDULED,
-        dedupe: bool = False,
+        kind: SyncKind = SyncKind.scheduled,
         sync_run_id: str | None = None,
         connect_timeout_ms: int | None = None,
         already_measured: frozenset[str] = frozenset(),
+        server_offset_minutes: int | None = None,
         max_retries: int | None = None,
     ) -> "asyncio.Future[SyncResult]":
-        if dedupe and account_id in self._pending_accounts:
-            return self._pending_accounts[account_id]
-
         future: "asyncio.Future[SyncResult]" = asyncio.get_running_loop().create_future()
         item = _QueuedTask(
             task=SyncTask(
@@ -174,18 +186,20 @@ class PoolManager:
                 login=login,
                 password=password,
                 server=server,
+                kind=kind,
                 sync_run_id=sync_run_id,
                 connect_timeout_ms=connect_timeout_ms,
                 already_measured=already_measured,
+                server_offset_minutes=server_offset_minutes,
             ),
             priority=priority,
             future=future,
             max_retries=max_retries,
         )
         # Tracked whatever the caller asked for, so a scheduled sync can dedupe
-        # against an initial or hard sync already running. `dedupe` only decides
-        # whether *this* request reuses it.
-        self._pending_accounts[account_id] = future
+        # against an initial or hard sync already running. Callers decide for
+        # themselves whether to reuse it, via `pending_for`.
+        self._pending_accounts[account_id] = (sync_run_id, future)
         self._queue.put_nowait((priority, next(self._sequence), item))
         log_event(
             logger, "info", "pool.task.queued",
@@ -194,23 +208,67 @@ class PoolManager:
         )
         return future
 
-    def pending_for(self, account_id: str) -> "asyncio.Future[SyncResult] | None":
-        """The in-flight sync for this account, if one is already running."""
+    def pending_for(
+        self, account_id: str
+    ) -> "tuple[str | None, asyncio.Future[SyncResult]] | None":
+        """Run id and future of the sync already in flight for this account."""
         return self._pending_accounts.get(account_id)
 
     # -- dispatch ----------------------------------------------------------
 
     async def _dispatch_loop(self) -> None:
+        """Hand tasks to idle workers, and outlive anything that goes wrong.
+
+        If this coroutine dies the pool stops dispatching for ever while every
+        worker still reports itself healthy - a far worse failure than a
+        crash, because nothing observes it. So the body is guarded and the
+        loop continues; `/healthz` reports the dispatcher separately.
+        """
         while not self._closing:
-            worker = await self._idle.get()
-            if self._closing:
-                return
-            _, _, item = await self._queue.get()
-            asyncio.create_task(
-                self._execute(worker, item), name=f"pool-task-{item.task.task_id}"
-            )
+            try:
+                worker = await self._idle.get()
+                if self._closing:
+                    return
+                _, _, item = await self._queue.get()
+                task = asyncio.create_task(
+                    self._execute(worker, item), name=f"pool-task-{item.task.task_id}"
+                )
+                self._running.add(task)
+                task.add_done_callback(self._running.discard)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log_event(
+                    logger, "error", "pool.dispatch.failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                await asyncio.sleep(1.0)
 
     async def _execute(self, worker: WorkerHandle, item: _QueuedTask) -> None:
+        """Run one task to a conclusion, whatever happens.
+
+        Everything below the guard has to hold two invariants: the worker
+        goes back to the idle queue or is marked failed, and the future is
+        resolved. Losing either one silently removes a terminal from the pool
+        or hangs a caller until its own timeout.
+        """
+        try:
+            await self._execute_guarded(worker, item)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_event(
+                logger, "error", "pool.task.crashed",
+                worker_id=worker.worker_id, account_id=item.task.account_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            self._in_flight.pop(item.task.task_id, None)
+            worker.state = WorkerState.failed
+            await self._complete(
+                item, self._failure(item, f"pool error: {type(exc).__name__}: {exc}")
+            )
+
+    async def _execute_guarded(self, worker: WorkerHandle, item: _QueuedTask) -> None:
         task = item.task
         item.attempts += 1
         worker.claim(task)
@@ -298,7 +356,8 @@ class PoolManager:
 
     def _resolve(self, item: _QueuedTask, result: SyncResult) -> None:
         account_id = item.task.account_id
-        if self._pending_accounts.get(account_id) is item.future:
+        pending = self._pending_accounts.get(account_id)
+        if pending is not None and pending[1] is item.future:
             self._pending_accounts.pop(account_id, None)
         if not item.future.done():
             item.future.set_result(result)
@@ -310,9 +369,15 @@ class PoolManager:
             ok=False,
             error=error,
             sync_run_id=item.task.sync_run_id,
+            kind=item.task.kind,
         )
 
     # -- introspection -----------------------------------------------------
+
+    @property
+    def dispatcher_alive(self) -> bool:
+        """False once the dispatcher has stopped, which no worker state shows."""
+        return self._dispatcher is not None and not self._dispatcher.done()
 
     def status(self) -> PoolStatus:
         queued = getattr(self._queue, "_queue", [])

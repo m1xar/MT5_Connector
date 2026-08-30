@@ -33,4 +33,5 @@ def build_sync_payload(history: RawHistory) -> SyncPayload:
         ),
         open_positions=build_open_positions(history.positions, history.orders),
         transactions=build_transactions(history.deals),
+        server_utc_offset_minutes=history.server_utc_offset_minutes,
     )

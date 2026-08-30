@@ -10,7 +10,7 @@ from sqlmodel import Field, SQLModel
 
 from utils.id import new_id
 
-from .enums import AccountStatus, SyncKind, SyncStatus
+from .enums import AccountStatus
 
 _JSON = JSON().with_variant(JSONB(), "postgresql")
 
@@ -46,6 +46,10 @@ class MT5Account(SQLModel, table=True):
     equity: float = Field(default=0.0)
     leverage: int = Field(default=0)
     currency: str = Field(default="")
+    # Minutes the trade server's clock runs ahead of real UTC. Every timestamp
+    # MT5 hands out is stamped in that clock, so this is what turns the stored
+    # times into real UTC on the way out.
+    server_utc_offset_minutes: Optional[int] = Field(default=None)
 
     last_synced_at: Optional[datetime] = Field(default=None, sa_column=_utc_column(index=True))
     last_error: Optional[str] = Field(default=None)
@@ -131,22 +135,3 @@ class MT5Transaction(SQLModel, table=True):
     amount: float = Field(default=0.0)
 
     synced_at: datetime = Field(default_factory=utc_now, sa_column=_utc_column())
-
-
-class MT5SyncRun(SQLModel, table=True):
-
-    __tablename__ = "mt5syncrun"
-
-    sync_run_id: str = Field(default_factory=new_id, primary_key=True)
-    account_id: str = Field(index=True)
-    kind: SyncKind = Field(default=SyncKind.scheduled, index=True)
-    status: SyncStatus = Field(default=SyncStatus.queued, index=True)
-    worker_id: Optional[str] = Field(default=None)
-
-    started_at: datetime = Field(default_factory=utc_now, sa_column=_utc_column(index=True))
-    finished_at: Optional[datetime] = Field(default=None, sa_column=_utc_column())
-    duration_ms: Optional[int] = Field(default=None)
-    positions_count: Optional[int] = Field(default=None)
-    open_positions_count: Optional[int] = Field(default=None)
-    transactions_count: Optional[int] = Field(default=None)
-    error: Optional[str] = Field(default=None)

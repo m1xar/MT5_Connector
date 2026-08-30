@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -61,6 +62,17 @@ async def lifespan(app: FastAPI):
 
     app.state.pool = terminal_pool
     app.state.sync_service = sync_service
+
+    # Every in-flight sync parks one thread in a blocking pipe read for its
+    # whole duration - up to the task timeout. The default executor is
+    # min(32, cpu_count + 4) threads and is shared with everything else, so it
+    # is sized to the pool explicitly rather than left to chance.
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(
+            max_workers=max(8, len(paths) * 2 + 8),
+            thread_name_prefix="mt5-pipe",
+        )
+    )
 
     await terminal_pool.start()
     track_bg_task(asyncio.create_task(scheduler_loop(sync_service), name="sync-scheduler"))

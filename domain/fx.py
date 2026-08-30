@@ -80,8 +80,14 @@ class FXPosition(FXBase):
     isolated: bool = Field(default=False, alias="Isolated")
     closed: bool = Field(default=False, alias="Closed")
     status: Optional[str] = Field(default=None, alias="Status")
+    # MT5 stamps every time in the trade server's clock, and that is what the
+    # unsuffixed fields carry - they are what the terminal itself would show.
+    # The *Utc pair is the same instant with the server's offset taken off, and
+    # is None while that offset is unknown.
     created_at: Optional[datetime] = Field(default=None, alias="CreatedAt")
     closed_at: Optional[datetime] = Field(default=None, alias="ClosedAt")
+    created_at_utc: Optional[datetime] = Field(default=None, alias="CreatedAtUtc")
+    closed_at_utc: Optional[datetime] = Field(default=None, alias="ClosedAtUtc")
     orders: List[FXOrder] = Field(default_factory=list, alias="Orders")
     balance_init: float = Field(default=0.0, alias="BalanceInit")
 
@@ -95,6 +101,7 @@ class FXOpenPosition(FXBase):
     entry_price: float = Field(default=0.0, alias="EntryPrice")
     current_price: float = Field(default=0.0, alias="CurrentPrice")
     open_time: Optional[datetime] = Field(default=None, alias="OpenTime")
+    open_time_utc: Optional[datetime] = Field(default=None, alias="OpenTimeUtc")
     orders: List[FXOrder] = Field(default_factory=list, alias="Orders")
 
 
@@ -106,10 +113,12 @@ class FXAccountInfo(FXBase):
 
 class UserBalanceSnapshot(FXBase):
     created_at: Optional[datetime] = Field(default=None, alias="CreatedAt")
+    created_at_utc: Optional[datetime] = Field(default=None, alias="CreatedAtUtc")
     balance: float = Field(default=0.0, alias="Balance")
 
 
 class Transaction(FXBase):
     time: Optional[datetime] = Field(default=None, alias="Time")
+    time_utc: Optional[datetime] = Field(default=None, alias="TimeUtc")
     type: str = Field(default="", alias="Type")
     amount: float = Field(default=0.0, alias="Amount")

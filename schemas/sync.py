@@ -57,5 +57,8 @@ class AccountInfoResponse(BaseModel):
     account_id: str
     account_info: fx.FXAccountInfo
     equity: float
+    # Minutes the trade server's clock runs ahead of real UTC. None means it
+    # has not been measured yet, and every *Utc field will be null.
+    server_utc_offset_minutes: Optional[int]
     last_synced_at: Optional[str]
     status: str

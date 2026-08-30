@@ -35,9 +35,13 @@ async def get_positions(
     session: AsyncSession = Depends(get_session),
     _auth: str | None = Depends(verify_auth),
 ):
-    await load_account(session, account_id)
+    account = await load_account(session, account_id)
     positions = await QueryService(session).positions(
-        account_id, days=days, limit=limit, offset=offset
+        account_id,
+        days=days,
+        limit=limit,
+        offset=offset,
+        server_offset_minutes=account.server_utc_offset_minutes,
     )
     return PositionListResponse(
         account_id=account_id, count=len(positions), positions=positions
@@ -55,8 +59,10 @@ async def get_open_positions(
     session: AsyncSession = Depends(get_session),
     _auth: str | None = Depends(verify_auth),
 ):
-    await load_account(session, account_id)
-    open_positions = await QueryService(session).open_positions(account_id)
+    account = await load_account(session, account_id)
+    open_positions = await QueryService(session).open_positions(
+        account_id, server_offset_minutes=account.server_utc_offset_minutes
+    )
     return OpenPositionListResponse(
         account_id=account_id, count=len(open_positions), open_positions=open_positions
     )
@@ -77,8 +83,12 @@ async def get_balance_snapshots(
     session: AsyncSession = Depends(get_session),
     _auth: str | None = Depends(verify_auth),
 ):
-    await load_account(session, account_id)
-    snapshots = await QueryService(session).balance_snapshots(account_id, days=days)
+    account = await load_account(session, account_id)
+    snapshots = await QueryService(session).balance_snapshots(
+        account_id,
+        days=days,
+        server_offset_minutes=account.server_utc_offset_minutes,
+    )
     return BalanceSnapshotListResponse(
         account_id=account_id, count=len(snapshots), snapshots=snapshots
     )
@@ -97,9 +107,13 @@ async def get_transactions(
     session: AsyncSession = Depends(get_session),
     _auth: str | None = Depends(verify_auth),
 ):
-    await load_account(session, account_id)
+    account = await load_account(session, account_id)
     transactions = await QueryService(session).transactions(
-        account_id, days=days, limit=limit, offset=offset
+        account_id,
+        days=days,
+        limit=limit,
+        offset=offset,
+        server_offset_minutes=account.server_utc_offset_minutes,
     )
     return TransactionListResponse(
         account_id=account_id, count=len(transactions), transactions=transactions
@@ -125,6 +139,7 @@ async def get_account_info(
             currency=account.currency,
         ),
         equity=account.equity,
+        server_utc_offset_minutes=account.server_utc_offset_minutes,
         last_synced_at=(
             account.last_synced_at.isoformat() if account.last_synced_at else None
         ),

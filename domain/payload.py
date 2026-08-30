@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from pydantic import Field
 
@@ -19,3 +19,6 @@ class SyncPayload(FXBase):
     positions: List[FXPosition] = Field(default_factory=list, alias="Positions")
     open_positions: List[FXOpenPosition] = Field(default_factory=list, alias="OpenPositions")
     transactions: List[Transaction] = Field(default_factory=list, alias="Transactions")
+    server_utc_offset_minutes: Optional[int] = Field(
+        default=None, alias="ServerUtcOffsetMinutes"
+    )
