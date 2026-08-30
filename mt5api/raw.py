@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
+from .clock import ServerClock
+
 DEAL_TYPE_BUY = 0
 DEAL_TYPE_SELL = 1
 DEAL_TYPE_BALANCE = 2
@@ -309,6 +311,6 @@ class RawHistory:
     deals: list[RawDeal] = field(default_factory=list)
     orders: list[RawOrder] = field(default_factory=list)
     positions: list[RawPosition] = field(default_factory=list)
-    # Minutes the trade server's clock runs ahead of real UTC, or None when it
-    # could not be measured. Every timestamp above is stamped in that clock.
-    server_utc_offset_minutes: int | None = None
+    # How far the trade server's clock ran ahead of real UTC, switch by switch.
+    # Every timestamp above is stamped in that clock.
+    clock: ServerClock = field(default_factory=ServerClock)

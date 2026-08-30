@@ -87,20 +87,11 @@ def _run_task(
                 terminal, settle_timeout_seconds=history_settle_timeout_seconds
             )
         )
-        # Measured this run if the market was quoting, otherwise whatever the
-        # last successful sync recorded. Only widens the candle request; when
-        # both are missing the request falls back to a blind slack.
-        server_offset = (
-            payload.server_utc_offset_minutes
-            if payload.server_utc_offset_minutes is not None
-            else task.server_offset_minutes
-        )
-        payload.server_utc_offset_minutes = server_offset
         if with_mae_mfe:
             enrich_mae_mfe(
                 payload.positions,
                 lambda symbol, interval, start, end: fetch_candles(
-                    terminal, symbol, interval, start, end, server_offset
+                    terminal, symbol, interval, start, end
                 ),
                 already_measured=task.already_measured,
             )

@@ -208,7 +208,6 @@ class PoolManager:
         sync_run_id: str | None = None,
         connect_timeout_ms: int | None = None,
         already_measured: frozenset[str] = frozenset(),
-        server_offset_minutes: int | None = None,
         max_retries: int | None = None,
     ) -> "asyncio.Future[SyncResult]":
         future: "asyncio.Future[SyncResult]" = asyncio.get_running_loop().create_future()
@@ -223,7 +222,6 @@ class PoolManager:
                 sync_run_id=sync_run_id,
                 connect_timeout_ms=connect_timeout_ms,
                 already_measured=already_measured,
-                server_offset_minutes=server_offset_minutes,
             ),
             priority=priority,
             future=future,

@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 from domain.enums import AccountStatus
 from domain.models import MT5Account
+from mt5api.clock import ServerClock
 
 
 class AccountCreateRequest(BaseModel):
@@ -60,7 +61,9 @@ def account_to_response(account: MT5Account) -> AccountResponse:
         enabled=account.enabled,
         status=account.status,
         consecutive_failures=account.consecutive_failures,
-        server_utc_offset_minutes=account.server_utc_offset_minutes,
+        server_utc_offset_minutes=ServerClock.from_rows(
+            account.server_clock
+        ).offset_minutes,
         balance=account.balance,
         equity=account.equity,
         leverage=account.leverage,

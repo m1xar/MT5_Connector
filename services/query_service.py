@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import List
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,8 +14,7 @@ from repositories.position_repo import OpenPositionRepository, PositionRepositor
 from repositories.transaction_repo import TransactionRepository
 
 
-def position_to_fx(row: MT5Position, clock: ServerClock | None = None) -> fx.FXPosition:
-    clock = clock or ServerClock()
+def position_to_fx(row: MT5Position, clock: ServerClock) -> fx.FXPosition:
     return fx.FXPosition(
         id=row.external_id,
         side=row.side,
@@ -46,10 +46,7 @@ def position_to_fx(row: MT5Position, clock: ServerClock | None = None) -> fx.FXP
     )
 
 
-def open_position_to_fx(
-    row: MT5OpenPosition, clock: ServerClock | None = None
-) -> fx.FXOpenPosition:
-    clock = clock or ServerClock()
+def open_position_to_fx(row: MT5OpenPosition, clock: ServerClock) -> fx.FXOpenPosition:
     return fx.FXOpenPosition(
         id=row.external_id,
         pair=row.pair,
@@ -63,10 +60,7 @@ def open_position_to_fx(
     )
 
 
-def transaction_to_fx(
-    row: MT5Transaction, clock: ServerClock | None = None
-) -> fx.Transaction:
-    clock = clock or ServerClock()
+def transaction_to_fx(row: MT5Transaction, clock: ServerClock) -> fx.Transaction:
     return fx.Transaction(
         time=as_server_time(row.time),
         time_utc=clock.to_utc(row.time),
@@ -76,8 +70,26 @@ def transaction_to_fx(
 
 
 class QueryService:
-    def __init__(self, session: AsyncSession) -> None:
+    """Stored rows turned into API shapes, in one account's clock."""
+
+    def __init__(self, session: AsyncSession, clock: ServerClock | None = None) -> None:
         self.session = session
+        self.clock = clock or ServerClock()
+
+    def _window_start(self, days: int | None) -> datetime | None:
+        """Where a `days` window starts, in the clock the stored times are in.
+
+        `days` counts back from real now, while every stored timestamp is in
+        the trade server's clock, so the boundary has to be moved into that
+        clock or the window is out by the offset. An unmeasured clock leaves it
+        where it is: a few hours of slack at the edge of a window is not the
+        same kind of wrong as a `*Utc` field that lies, and dropping the window
+        entirely would be worse than both.
+        """
+        cutoff = cutoff_from_days(days)
+        if cutoff is None:
+            return None
+        return as_server_time(self.clock.to_server(cutoff) or cutoff)
 
     async def positions(
         self,
@@ -85,18 +97,18 @@ class QueryService:
         days: int | None = None,
         limit: int = 500,
         offset: int = 0,
-        clock: ServerClock | None = None,
     ) -> List[fx.FXPosition]:
         rows = await PositionRepository(self.session).list(
-            account_id, closed_after=cutoff_from_days(days), limit=limit, offset=offset
+            account_id,
+            closed_after=self._window_start(days),
+            limit=limit,
+            offset=offset,
         )
-        return [position_to_fx(row, clock) for row in rows]
+        return [position_to_fx(row, self.clock) for row in rows]
 
-    async def open_positions(
-        self, account_id: str, clock: ServerClock | None = None
-    ) -> List[fx.FXOpenPosition]:
+    async def open_positions(self, account_id: str) -> List[fx.FXOpenPosition]:
         rows = await OpenPositionRepository(self.session).list(account_id)
-        return [open_position_to_fx(row, clock) for row in rows]
+        return [open_position_to_fx(row, self.clock) for row in rows]
 
     async def transactions(
         self,
@@ -104,22 +116,18 @@ class QueryService:
         days: int | None = None,
         limit: int = 500,
         offset: int = 0,
-        clock: ServerClock | None = None,
     ) -> List[fx.Transaction]:
         rows = await TransactionRepository(self.session).list(
-            account_id, after=cutoff_from_days(days), limit=limit, offset=offset
+            account_id, after=self._window_start(days), limit=limit, offset=offset
         )
-        return [transaction_to_fx(row, clock) for row in rows]
+        return [transaction_to_fx(row, self.clock) for row in rows]
 
     async def balance_snapshots(
-        self,
-        account_id: str,
-        days: int | None = None,
-        clock: ServerClock | None = None,
+        self, account_id: str, days: int | None = None
     ) -> List[fx.UserBalanceSnapshot]:
         rows = await PositionRepository(self.session).list_all(account_id)
         return build_balance_snapshots(
-            [position_to_fx(row, clock) for row in rows],
-            days=days,
-            clock=clock,
+            [position_to_fx(row, self.clock) for row in rows],
+            since=self._window_start(days),
+            clock=self.clock,
         )

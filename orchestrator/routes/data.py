@@ -25,7 +25,7 @@ _DAYS = Query(default=0, ge=0, description="Window in days; 0 means everything")
 
 def _clock(account: MT5Account) -> ServerClock:
     """The trade server's clock as this account last measured it."""
-    return ServerClock(offset_minutes=account.server_utc_offset_minutes)
+    return ServerClock.from_rows(account.server_clock)
 
 
 @router.get(
@@ -43,12 +43,8 @@ async def get_positions(
     _auth: str | None = Depends(verify_auth),
 ):
     account = await load_account(session, account_id)
-    positions = await QueryService(session).positions(
-        account_id,
-        days=days,
-        limit=limit,
-        offset=offset,
-        clock=_clock(account),
+    positions = await QueryService(session, _clock(account)).positions(
+        account_id, days=days, limit=limit, offset=offset
     )
     return PositionListResponse(
         account_id=account_id, count=len(positions), positions=positions
@@ -67,8 +63,8 @@ async def get_open_positions(
     _auth: str | None = Depends(verify_auth),
 ):
     account = await load_account(session, account_id)
-    open_positions = await QueryService(session).open_positions(
-        account_id, clock=_clock(account)
+    open_positions = await QueryService(session, _clock(account)).open_positions(
+        account_id
     )
     return OpenPositionListResponse(
         account_id=account_id, count=len(open_positions), open_positions=open_positions
@@ -91,10 +87,8 @@ async def get_balance_snapshots(
     _auth: str | None = Depends(verify_auth),
 ):
     account = await load_account(session, account_id)
-    snapshots = await QueryService(session).balance_snapshots(
-        account_id,
-        days=days,
-        clock=_clock(account),
+    snapshots = await QueryService(session, _clock(account)).balance_snapshots(
+        account_id, days=days
     )
     return BalanceSnapshotListResponse(
         account_id=account_id, count=len(snapshots), snapshots=snapshots
@@ -115,12 +109,8 @@ async def get_transactions(
     _auth: str | None = Depends(verify_auth),
 ):
     account = await load_account(session, account_id)
-    transactions = await QueryService(session).transactions(
-        account_id,
-        days=days,
-        limit=limit,
-        offset=offset,
-        clock=_clock(account),
+    transactions = await QueryService(session, _clock(account)).transactions(
+        account_id, days=days, limit=limit, offset=offset
     )
     return TransactionListResponse(
         account_id=account_id, count=len(transactions), transactions=transactions
@@ -146,7 +136,7 @@ async def get_account_info(
             currency=account.currency,
         ),
         equity=account.equity,
-        server_utc_offset_minutes=account.server_utc_offset_minutes,
+        server_utc_offset_minutes=_clock(account).offset_minutes,
         last_synced_at=(
             account.last_synced_at.isoformat() if account.last_synced_at else None
         ),

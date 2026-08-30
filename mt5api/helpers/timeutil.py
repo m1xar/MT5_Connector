@@ -43,31 +43,22 @@ def as_server_time(value: datetime | None) -> datetime | None:
     return value.replace(tzinfo=None)
 
 
-def to_real_utc(value: datetime | None, offset_minutes: int | None) -> datetime | None:
-    """The same instant with the trade server's offset taken off.
+def as_mt5_time(value: datetime) -> datetime:
+    """A server-clock timestamp, in the form the terminal reads back exactly.
 
-    Everything MT5 hands out is stamped in the server's clock while looking
-    exactly like a UTC epoch, so that is what got stored. Undoing it is a
-    read-side concern, like the `days` window: the stored value stays the one
-    the terminal itself would show.
+    Every datetime handed to MT5 is reduced to a unix epoch and compared
+    straight against the bar and deal stamps, which are server wall-clock
+    times dressed as UTC epochs. So the argument has to be the server wall
+    clock labelled UTC, and then the comparison is exact.
 
-    None when the offset is unknown - a wrong answer here is worse than no
-    answer, and the offset can only be measured while the market quotes.
+    A naive datetime does not survive that trip: the package resolves it
+    through the *machine's* timezone, and the epoch that arrives is out by
+    whatever the machine happens to be set to. Measured here, on a machine on
+    Eastern European time, asking for 12:00 handed back bars stamped 09:00 in
+    summer and 10:00 in winter - the machine's own offset both times, and the
+    same for every broker, because the broker never came into it. Tagging the
+    argument UTC makes that conversion the identity and the shift disappears.
     """
-    if value is None or offset_minutes is None:
-        return None
-    return value - timedelta(minutes=offset_minutes)
-
-
-def as_naive_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value
-    return value.astimezone(timezone.utc).replace(tzinfo=None)
-
-
-def is_after_cutoff(value: datetime | None, cutoff: datetime | None) -> bool:
-    if cutoff is None:
-        return True
-    if value is None:
-        return False
-    return not value < cutoff
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)

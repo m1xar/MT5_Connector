@@ -5,7 +5,7 @@ import time
 from utils.logging import get_logger, log_event
 
 from .clock import measure_server_clock
-from .helpers.timeutil import as_naive_utc, history_range
+from .helpers.timeutil import as_mt5_time, history_range
 from .raw import RawAccount, RawDeal, RawHistory, RawOrder, RawPosition
 from .terminal import MT5Terminal, TerminalError
 
@@ -23,7 +23,7 @@ def fetch_account(terminal: MT5Terminal) -> RawAccount:
 def fetch_deals(terminal: MT5Terminal, days: int | None = None) -> list[RawDeal]:
     start, end = history_range(days)
     rows = terminal.check_call(
-        terminal.mt5.history_deals_get(as_naive_utc(start), as_naive_utc(end)),
+        terminal.mt5.history_deals_get(as_mt5_time(start), as_mt5_time(end)),
         "history_deals_get",
     )
     return [RawDeal.from_mt5(row) for row in rows]
@@ -32,7 +32,7 @@ def fetch_deals(terminal: MT5Terminal, days: int | None = None) -> list[RawDeal]
 def fetch_orders(terminal: MT5Terminal, days: int | None = None) -> list[RawOrder]:
     start, end = history_range(days)
     rows = terminal.check_call(
-        terminal.mt5.history_orders_get(as_naive_utc(start), as_naive_utc(end)),
+        terminal.mt5.history_orders_get(as_mt5_time(start), as_mt5_time(end)),
         "history_orders_get",
     )
     return [RawOrder.from_mt5(row) for row in rows]
@@ -76,7 +76,7 @@ def wait_for_history(
     seconds.
     """
     start, end = history_range(None)
-    start, end = as_naive_utc(start), as_naive_utc(end)
+    start, end = as_mt5_time(start), as_mt5_time(end)
     started = time.monotonic()
     deadline = started + timeout_seconds
 
@@ -134,12 +134,10 @@ def fetch_history(
     open_positions = fetch_open_positions(terminal)
     # Measured from the symbols this account actually trades, so a broker
     # carrying none of the usual majors still gets an answer.
-    # Measured from the symbols this account actually trades, so a broker
-    # carrying none of the usual majors still gets an answer.
-    server_offset = measure_server_clock(
+    clock = measure_server_clock(
         terminal,
         symbols=[deal.symbol for deal in reversed(deals) if deal.symbol][:4],
-    ).offset_minutes
+    )
     open_orders = fetch_open_orders(terminal)
 
     log_event(
@@ -150,12 +148,12 @@ def fetch_history(
         deals=len(deals),
         orders=len(orders),
         open_positions=len(open_positions),
-        server_utc_offset_minutes=server_offset,
+        server_utc_offset_minutes=clock.offset_minutes,
     )
     return RawHistory(
         account=account,
         deals=deals,
         orders=orders + open_orders,
         positions=open_positions,
-        server_utc_offset_minutes=server_offset,
+        clock=clock,
     )

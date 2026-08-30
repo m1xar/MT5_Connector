@@ -42,9 +42,6 @@ class SyncTask:
     # Positions whose MAE/MFE is already stored; the worker skips pricing
     # them rather than re-fetching candles from years ago.
     already_measured: frozenset = frozenset()
-    # The offset measured on the last successful sync. Used only as a fallback:
-    # the worker measures its own, and cannot while the market is shut.
-    server_offset_minutes: Optional[int] = None
 
 
 @dataclass(slots=True)

@@ -46,10 +46,11 @@ class MT5Account(SQLModel, table=True):
     equity: float = Field(default=0.0)
     leverage: int = Field(default=0)
     currency: str = Field(default="")
-    # Minutes the trade server's clock runs ahead of real UTC. Every timestamp
-    # MT5 hands out is stamped in that clock, so this is what turns the stored
-    # times into real UTC on the way out.
-    server_utc_offset_minutes: Optional[int] = Field(default=None)
+    # The trade server's clock as [server label, offset minutes] pairs, one
+    # per daylight saving switch. Every timestamp MT5 hands out is stamped in
+    # that clock, so this is what turns the stored times into real UTC on the
+    # way out - with the offset that was in force at the time, not today's.
+    server_clock: List[List[Any]] = Field(default_factory=list, sa_column=Column(_JSON))
 
     last_synced_at: Optional[datetime] = Field(default=None, sa_column=_utc_column(index=True))
     last_error: Optional[str] = Field(default=None)

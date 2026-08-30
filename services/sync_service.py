@@ -73,7 +73,6 @@ class SyncService:
             sync_run_id=sync_run_id,
             connect_timeout_ms=connect_timeout_ms,
             already_measured=already_measured,
-            server_offset_minutes=account.server_utc_offset_minutes,
             # One attempt, on the long timeout it was already given. Three
             # attempts turned a 120s budget into a 400s wait.
             max_retries=0 if kind == SyncKind.initial else None,
@@ -146,7 +145,7 @@ class SyncService:
             equity=payload.equity,
             leverage=payload.account_info.leverage,
             currency=payload.account_info.currency,
-            server_utc_offset_minutes=payload.server_utc_offset_minutes,
+            server_clock=payload.server_clock,
         )
         log_event(
             logger,
@@ -156,6 +155,6 @@ class SyncService:
             positions=positions_count,
             open_positions=open_count,
             new_transactions=transactions_count,
-            server_utc_offset_minutes=payload.server_utc_offset_minutes,
+            server_clock_switches=max(len(payload.server_clock) - 1, 0),
             duration_ms=result.duration_ms,
         )

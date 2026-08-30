@@ -56,7 +56,7 @@ so these pydantic models keep snake_case attributes but serialize by alias to
 | `UserBalanceSnapshot` | derived from positions, never stored |
 | `MAE` / `MFE` | candles the position lived through |
 | `RR` / `RRPlanned` | entry, stop loss, take profit — no candles involved |
-| `*Utc` timestamps | the unsuffixed field minus the trade server's offset |
+| `*Utc` timestamps | the unsuffixed field minus the server's offset *as it stood then* |
 
 Four tables are stored: accounts, closed positions, open positions and
 transactions. Sync runs are deliberately not one of them — a sync is either in
@@ -89,7 +89,7 @@ sidesteps contract sizes and deposit-currency conversion completely — no
 (MAE <= 0, MFE >= 0), taken from the high and low of the candles between
 `CreatedAt` and `ClosedAt`. Candle pulls dominate sync time, so the span is
 split into minute bars at the edges and daily bars in between
-(`helpers/candlespan.py`) — exact for a high/low, and a position open for
+(`enrichment._segments`) — exact for a high/low, and a position open for
 months does not drag in months of minute bars. Set
 `MT5_API_ENRICH_MAE_MFE=false` to skip it.
 
@@ -130,12 +130,12 @@ pool/
 mt5api/
   terminal.py       the only module that imports MetaTrader5
   executors.py      account, deals, orders, positions - and waiting for history
-  candles.py        candle windows, with the clock skew and the stray bars
-  clock.py          the server's UTC offset, read off the trading week
+  candles.py        candle windows, and the stray bars from missing history
+  clock.py          the server's UTC offset per switch, read off the trading week
   payload.py        one terminal read -> SyncPayload
   enrichment.py     MAE/MFE across a set of positions
   builders/         deals -> FX models (ported from Go); enrich.py has MAE/MFE and RR
-  helpers/          ledger.py (balance reconstruction), candlespan.py, timeutil, mathutil
+  helpers/          ledger.py (balance reconstruction), timeutil, mathutil
   raw.py            MT5 rows -> plain dataclasses
 
 domain/             fx.py (canonical models), models.py (tables), enums.py
@@ -240,14 +240,16 @@ That is internally consistent, so every calculation is right: deals, positions
 and candles all live in the same scale. It is only wrong at the edges, where a
 consumer reasonably assumes UTC.
 
-So the offset is measured and reported rather than guessed at. The result is
-stored on the account as `server_utc_offset_minutes` and shown in
-`GET /accounts/{id}` and `/accounts/{id}/info`. Timestamps then come back in
-pairs — `ClosedAt` is what the terminal itself would show, `ClosedAtUtc` is the
-same instant in real UTC:
+So the offset is measured and reported rather than guessed at — not one
+offset, but the whole history of it, since a broker that keeps daylight saving
+was not on today's offset last January. The result is stored on the account as
+`server_clock`, a step per switch, and the offset in force *now* is shown as
+`server_utc_offset_minutes` in `GET /accounts/{id}` and `/accounts/{id}/info`.
+Timestamps come back in pairs — `ClosedAt` is what the terminal itself would
+show, `ClosedAtUtc` is the same instant in real UTC:
 
 ```json
-{ "ClosedAt": "2025-03-14T15:30:00", "ClosedAtUtc": "2025-03-14T12:30:00Z" }
+{ "ClosedAt": "2025-03-14T15:30:00", "ClosedAtUtc": "2025-03-14T13:30:00Z" }
 ```
 
 Only the `*Utc` twin carries a `Z`. The unsuffixed field deliberately does not:
@@ -266,45 +268,64 @@ it reads as a perfectly plausible offset, drifting an hour further out with
 every hour that passes. Since the scheduler syncs every fifteen minutes, every
 weekend would walk straight through that window and store the result.
 
-`mt5api/clock.py` uses the trading week instead. Forex opens and closes at 17:00
-in New York, which is a known instant in real UTC for any date — New York's own
-daylight saving is in the zone database. The same boundary appears in the bar
-labels as the two edges of the weekend gap, stamped in the server's clock. The
-difference between them is the offset.
+`mt5api/clock.py` uses the trading week instead. Forex ends its week at 17:00 in
+New York, a known instant in real UTC for any date — New York's own daylight
+saving is in the zone database. That boundary appears in the bar labels as the
+last bar before the weekend gap, stamped in the server's clock, and the
+difference between the two is the offset.
 
 Bars are pulled **by position**, so no date is ever sent to the terminal and
-nothing can be shifted on the way in. Both edges of each gap are sampled, which
-cancels out a broker that stops quoting early and resumes late, and several
-weeks are reduced by median so one holiday cannot decide the answer. Measured on
-two brokers, eight weekends each: every single reading agreed, and it works with
-the market shut, which is exactly when the old approach was least trustworthy.
+nothing can be shifted on the way in. One call for 60 000 hourly bars covers ten
+years; the same number of *minute* bars would cover two months, which is all the
+minute history most brokers keep anyway. A terminal that already holds the
+history answers in milliseconds. One that does not has to download it, which
+was measured at well under a minute and happens once per terminal process, on
+the first account it syncs.
 
-### Daylight saving, still open
+Only the Friday edge is read. The Sunday one looks like it should say the same
+thing and does not: for the three weeks each March when New York has moved to
+summer time and Europe has not, the broker measured here still opened its week
+at midnight server time — an hour after the market itself — and that edge reads
+an hour high for every one of them. The close follows the market; the open
+follows the broker's session table.
 
-Brokers move with daylight saving on their own schedule, so a position from the
-far side of a switch wants the offset that was in force *then*, not today's.
-Today's is what it gets, so such a position is an hour out.
+### Daylight saving, closed
 
-Reading the switches off the same weekend boundaries was tried and dropped. The
-step is easy — an hour, clearly visible in hourly bars, which reach back years
-where minute bars reach back weeks. The *dates* are not. The anchor is 17:00 in
-New York, and New York keeps its own daylight saving on the American calendar,
-a fortnight away from the European one. Whether a broker's week-open follows
-the New York session or its own local midnight decides which of the two
-calendars the measurement picks up, and that differs by broker: of two tested,
-one produced the European rule and the other the American one, from identical
-code against identical-looking data. A rule that is confidently wrong for half
-the brokers is worse than no rule, because it moves timestamps in the wrong
-direction rather than leaving them honestly approximate.
+Every weekend in the scan is read, not just the latest, so the offset is known
+as it stood on each of them. Collapse the readings to the points where they
+change and you have the broker's own daylight saving schedule, measured rather
+than assumed — no calendar, and no guess about whether a broker follows the
+European rule or the American one. A timestamp is then converted with the
+offset that was in force when it was stamped:
 
-Doing it properly needs the broker's own schedule, which MT5 does not expose.
+```
+2025-01-15  ClosedAt 12:00 → ClosedAtUtc 10:00Z   (UTC+2)
+2025-07-15  ClosedAt 12:00 → ClosedAtUtc 09:00Z   (UTC+3)
+```
 
-**`*Utc` is null when the offset cannot be measured**, which is a better answer
-than a wrong one. That now means a symbol with under a couple of months of
-minute history, rather than "it is Saturday".
+Two rules separate a switch from a holiday, and both come from the same fact:
+**a reading can only come in low.** The market really does stop at 17:00 in New
+York, so the last bar of the week cannot sit *after* it, while a broker that
+shuts early for a holiday leaves one sitting well before it — three and five
+hours early over Christmas, on the account this was built against. So a change
+is only believed when it is *exactly an hour* and the next weekend *still
+agrees*. Over ten years of hourly history, 496 of 502 weekend readings matched
+the zone the broker turned out to keep, and the two rules together drop all six
+that did not. The result was 20 steps, each landing on the correct European
+switch date.
+
+Each step is keyed by the first bar after the weekend the switch happened in.
+Both ends of that weekend are known — the change shows up at one Friday close
+and not the one before it, and the only Sunday between them is inside that gap —
+and no trade is stamped while the market is shut, so nothing lands in the part
+that is ambiguous.
+
+**`*Utc` is null when the clock cannot be measured**, and for a timestamp older
+than the scan reached, which is a better answer than a wrong one.
 
 The stored value is never rewritten: converting is a read-side concern, exactly
-like the `days` window.
+like the `days` window — which is itself translated into the server's clock
+before it is compared against anything, for the same reason.
 
 ## What the terminal actually requires
 
@@ -375,16 +396,27 @@ balance with no deals to explain it, so the damage is quietly wrong numbers
 rather than a failure. `executors.wait_for_history` blocks until the count
 settles, and refuses to believe a zero on an account that holds money.
 
-**`copy_rates_range` reads its arguments in a different clock than it answers
-in.** The datetimes handed to it are taken as trade-server time, while the bar
-times it returns line up with deal times: against a UTC+3 server, asking for
-12:00-14:00 returns bars stamped 09:00-11:00. Trimming that to the window asked
-for leaves only the overlap, which is *empty* for any position shorter than the
-offset - it left 61 of one account's 91 positions with no candles and quietly
-truncated the rest. `fetch_candles` widens the request by the server's measured
-offset plus a two-hour margin and trims by bar time. When the offset could not
-be measured the request falls back to a slack wider than any real trade
-server.
+**A naive datetime handed to MT5 is read in *this machine's* timezone.** Every
+datetime the package is given is reduced to a unix epoch and compared straight
+against the bar and deal stamps, which are server wall-clock times dressed as
+UTC epochs. A naive one gets there through the local-time conversion of
+whichever machine made the call: on a machine on Eastern European time, asking
+`copy_rates_range` for 12:00 returned bars stamped 09:00 in summer and 10:00 in
+winter — the machine's own offset both times, the same for every broker,
+because the broker never came into it.
+
+That is easy to misread as the *server* reinterpreting the request, and the fix
+that follows from the misreading — widen by the measured server offset, trim
+back by bar time — only worked because on that machine the two offsets happened
+to be the same number. It also missed the second half of the shift entirely:
+inside the worker, position times are naive server labels, so `.timestamp()`
+applied the machine's offset a *second* time and MAE/MFE was priced from bars
+three hours before the position ever traded, on every position measured during
+a sync.
+
+`helpers/timeutil.as_mt5_time` tags the argument UTC, which makes the package's
+conversion the identity. The window then comes back exactly as asked for — no
+widening, no offset needed, and the same answer on any machine.
 
 **`copy_rates_range` does not report "nothing here" as empty.** Asked for three
 hours in 2022 on a symbol whose minute history reaches back 70 days, it returns
@@ -586,7 +618,7 @@ is the reconstruction itself, which needs an account with real trading history:
    and finish the task.
 5. Check the clock: `GET /accounts/{id}/info` should report a
    `server_utc_offset_minutes` that matches the terminal's own Market Watch
-   time, and `ClosedAtUtc` on a position should be that many minutes behind
-   `ClosedAt`. It reads off history rather than a live quote, so the weekend is
-   as good a time as any — and a position from the far side of a daylight
-   saving switch will be an hour out, which is known and unfixed.
+   time. It reads off history rather than a live quote, so the weekend is as
+   good a time as any. Then check positions from either side of a daylight
+   saving switch — on a broker keeping European time, `ClosedAt` minus
+   `ClosedAtUtc` should be three hours in July and two in January.

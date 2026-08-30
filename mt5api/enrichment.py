@@ -1,38 +1,50 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from typing import Callable, Collection, Iterable
 
 from domain import fx
 from utils.logging import get_logger, log_event
 
 from .builders.enrich import apply_fx_mae_mfe, candle_high_low
-from .helpers.candlespan import split
 from .raw import RawCandle
 
 logger = get_logger(__name__)
 
 CandleFetcher = Callable[[str, str, datetime, datetime], list[RawCandle]]
 
+MINUTE = "1m"
+DAY = "1d"
 
-def _from_ms(value: int) -> datetime:
-    return datetime.fromtimestamp(value / 1000.0, tz=timezone.utc)
+# Under this, a position is priced from minute bars end to end. Over it, the
+# whole days in the middle come from daily bars instead: a fortnight of minute
+# bars is twenty thousand rows to find one high and one low.
+_MIN_SPAN_FOR_DAILY = timedelta(days=2)
+_TICK = timedelta(microseconds=1)
 
 
-def candles_for_span(
-    fetch: CandleFetcher,
-    pair: str,
-    start: datetime,
-    end: datetime,
-) -> list[RawCandle]:
-    candles: list[RawCandle] = []
-    start_ms = int(start.timestamp() * 1000)
-    end_ms = int(end.timestamp() * 1000)
-    for segment in split(start_ms, end_ms):
-        candles.extend(
-            fetch(pair, segment.interval, _from_ms(segment.start_ms), _from_ms(segment.end_ms))
-        )
-    return candles
+def _segments(start: datetime, end: datetime) -> list[tuple[str, datetime, datetime]]:
+    """The window split into the coarsest bars that still cover it exactly.
+
+    Both ends are server-clock timestamps, and a daily bar is stamped at the
+    server's own midnight, so the day boundaries are taken from the timestamps
+    as they stand rather than converted first.
+    """
+    if end <= start or end - start < _MIN_SPAN_FOR_DAILY:
+        return [(MINUTE, start, end)]
+
+    midnight = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    first_day = midnight if midnight == start else midnight + timedelta(days=1)
+    last_day = end.replace(hour=0, minute=0, second=0, microsecond=0)
+    if last_day <= first_day:
+        return [(MINUTE, start, end)]
+
+    segments: list[tuple[str, datetime, datetime]] = []
+    if start < first_day:
+        segments.append((MINUTE, start, first_day - _TICK))
+    segments.append((DAY, first_day, last_day - _TICK))
+    segments.append((MINUTE, last_day, end))
+    return segments
 
 
 def enrich_mae_mfe(
@@ -67,9 +79,11 @@ def enrich_mae_mfe(
     rejected = 0
     for position in closed:
         try:
-            candles = candles_for_span(
-                fetch, position.pair, position.created_at, position.closed_at
-            )
+            candles: list[RawCandle] = []
+            for interval, start, end in _segments(
+                position.created_at, position.closed_at
+            ):
+                candles.extend(fetch(position.pair, interval, start, end))
         except Exception as exc:
             log_event(
                 logger,

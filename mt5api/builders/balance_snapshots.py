@@ -1,21 +1,23 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from domain import fx
 
 from ..clock import ServerClock
-from ..helpers.timeutil import cutoff_from_days, is_after_cutoff
 
 
 def build_balance_snapshots(
     positions: list[fx.FXPosition],
-    days: int | None = None,
+    since: datetime | None = None,
     clock: ServerClock | None = None,
 ) -> list[fx.UserBalanceSnapshot]:
     """The account balance over time, derived rather than stored.
 
     One point for the balance the first position opened against, then one after
-    each close. `days` trims the result rather than the input: the series has to
-    be built from every position, or the first point would start mid-history.
+    each close. `since` trims the result rather than the input: the series has
+    to be built from every position, or the first point would start mid-history.
+    It is a server-clock instant, like the timestamps it is compared against.
     """
     clock = clock or ServerClock()
     closed = sorted(
@@ -42,8 +44,11 @@ def build_balance_snapshots(
         if position.closed_at is not None
     ]
 
-    cutoff = cutoff_from_days(days)
-    if cutoff is not None:
-        snapshots = [s for s in snapshots if is_after_cutoff(s.created_at, cutoff)]
+    if since is not None:
+        snapshots = [
+            snapshot
+            for snapshot in snapshots
+            if snapshot.created_at is not None and snapshot.created_at >= since
+        ]
     snapshots.sort(key=lambda item: (item.created_at is None, item.created_at))
     return snapshots

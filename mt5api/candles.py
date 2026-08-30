@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from utils.logging import get_logger, log_event
 
-from .helpers.timeutil import as_naive_utc
+from .helpers.timeutil import as_mt5_time, as_server_time
 from .raw import TIMEFRAME_D1, TIMEFRAME_M1, RawCandle
 from .terminal import MT5Terminal
 
@@ -13,21 +13,6 @@ logger = get_logger(__name__)
 
 _TIMEFRAMES = {"1m": TIMEFRAME_M1, "1d": TIMEFRAME_D1}
 
-# Used when the server's offset could not be measured - over a weekend, say.
-# Wider than any real trade server is from UTC, so the requested window is
-# always inside what comes back whichever way the server's clock leans.
-_BLIND_SLACK = timedelta(hours=15)
-
-# Added on top of a measured offset: an hour for the broker's own daylight
-# saving switch, which does not follow ours, plus room for bar alignment.
-_MEASURED_MARGIN = timedelta(hours=2)
-
-
-def _slack(server_offset_minutes: int | None) -> timedelta:
-    if server_offset_minutes is None:
-        return _BLIND_SLACK
-    return timedelta(minutes=abs(server_offset_minutes)) + _MEASURED_MARGIN
-
 
 def fetch_candles(
     terminal: MT5Terminal,
@@ -35,55 +20,39 @@ def fetch_candles(
     interval: str,
     start: datetime,
     end: datetime,
-    server_offset_minutes: int | None = None,
 ) -> list[RawCandle]:
     """Candles inside [start, end], and nothing else.
 
-    Two things make this less obvious than it looks.
+    Both ends are server-clock timestamps, which is what `copy_rates_range`
+    matches its arguments against once `as_mt5_time` has kept them from being
+    reinterpreted on the way in. The window then comes back exactly as asked
+    for; it used to be widened by the server's offset and trimmed back, which
+    was a fix for the wrong thing.
 
-    `copy_rates_range` reads the datetimes it is given in the *trade server's*
-    clock, while the bar times it returns line up with deal times. Against a
-    UTC+3 server, asking for 12:00-14:00 hands back bars stamped 09:00-11:00.
-    Filtering that to the requested window leaves only the overlap, which is
-    empty for any position shorter than the offset - 61 of one account's 91
-    positions came back with no candles at all for exactly that reason.
-
-    So the request is widened by the server's measured offset plus a margin,
-    and the answer trimmed by bar time - which has been verified against deal
-    times: the bar holding a deal's entry price sits within a minute of the
-    deal. Trimming stays even though the offset is now known, because the
-    offset is measured from a live tick and cannot be measured at all while
-    the market is shut; when it is unknown the request falls back to a slack
-    wider than any real trade server.
-
-    And `copy_rates_range` does not report "nothing for that range" as an empty
-    result. Asked for three hours in 2022 on a symbol whose minute history only
-    reaches back ~70 days, it returns a single unrelated bar from months later.
-    That once produced a 161 EUR excursion on a 0.01 lot position in a 109 EUR
-    account. Dropping everything is the right answer when the history is not
-    there: `candle_high_low` then yields no high or low, and MAE/MFE stay None
+    The trimming stays, for a different reason. `copy_rates_range` does not
+    report "nothing for that range" as an empty result: asked for three hours
+    in 2022 on a symbol whose minute history only reaches back ~70 days, it
+    returns a single unrelated bar from months later. That once produced a
+    161 EUR excursion on a 0.01 lot position in a 109 EUR account. Dropping
+    everything is the right answer when the history is not there -
+    `candle_high_low` then yields no high or low, and MAE/MFE stay None
     instead of becoming confident nonsense.
     """
     timeframe = _TIMEFRAMES[interval]
     terminal.mt5.symbol_select(symbol, True)
-    window_start, window_end = as_naive_utc(start), as_naive_utc(end)
-    slack = _slack(server_offset_minutes)
     rows = terminal.check_call(
         terminal.mt5.copy_rates_range(
-            symbol,
-            timeframe,
-            window_start - slack,
-            window_end + slack,
+            symbol, timeframe, as_mt5_time(start), as_mt5_time(end)
         ),
         "copy_rates_range",
     )
 
+    window_start, window_end = as_server_time(start), as_server_time(end)
     candles = [RawCandle.from_mt5(row) for row in rows]
     inside = [
         candle
         for candle in candles
-        if candle.time is not None
-        and window_start <= as_naive_utc(candle.time) <= window_end
+        if candle.time is not None and window_start <= candle.time <= window_end
     ]
     if len(inside) != len(candles):
         log_event(
@@ -94,7 +63,6 @@ def fetch_candles(
             interval=interval,
             window_start=window_start.isoformat(),
             window_end=window_end.isoformat(),
-            slack_minutes=int(slack.total_seconds() // 60),
             returned=len(candles),
             kept=len(inside),
         )

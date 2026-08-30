@@ -83,16 +83,16 @@ class AccountRepository:
         equity: float,
         leverage: int,
         currency: str,
-        server_utc_offset_minutes: int | None = None,
+        server_clock: list | None = None,
     ) -> MT5Account:
         account.balance = balance
         account.equity = equity
         account.leverage = leverage
         account.currency = currency
-        # Left alone when this sync could not measure it - a weekend must not
-        # erase a offset that was measured perfectly well on Friday.
-        if server_utc_offset_minutes is not None:
-            account.server_utc_offset_minutes = server_utc_offset_minutes
+        # Left alone when this sync could not measure it, rather than erasing
+        # a clock that was read perfectly well on the last one.
+        if server_clock:
+            account.server_clock = server_clock
         account.status = AccountStatus.active
         account.consecutive_failures = 0
         account.last_error = None
