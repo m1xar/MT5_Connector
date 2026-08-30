@@ -20,6 +20,8 @@ from .protocol import (
     SyncTask,
     WorkerState,
 )
+from mt5api.terminal import IPC_ERROR_CEILING
+
 from .worker import worker_main
 from .worker_handle import WorkerHandle
 
@@ -42,12 +44,20 @@ _SHUTDOWN_DRAIN_SECONDS = 30.0
 _REAP_INTERVAL_SECONDS = 60.0
 
 
+def _lost_its_terminal(result: SyncResult) -> bool:
+    """Whether this failure means the worker's terminal is gone for good."""
+    return result.error_code is not None and result.error_code <= IPC_ERROR_CEILING
+
+
 @dataclass
 class _QueuedTask:
     task: SyncTask
     priority: int
     future: "asyncio.Future[SyncResult]"
     attempts: int = 0
+    # Times this was moved off a worker whose terminal had died. Counted apart
+    # from attempts, because losing a terminal says nothing about the account.
+    reassignments: int = 0
     # None means the pool default; an initial sync sets 0, having already been
     # given a long connect timeout for its one fair attempt.
     max_retries: int | None = None
@@ -336,6 +346,21 @@ class PoolManager:
 
         result, worker_healthy = await self._roundtrip(worker, item)
 
+        # A terminal that has dropped its IPC channel does not come back inside
+        # the worker that owns it: the MetaTrader5 module is a process-global
+        # singleton, and once the pipe has gone, `initialize` returns True
+        # without relaunching anything. Every later task on that worker then
+        # fails instantly while the pool still counts it healthy. Replacing the
+        # process is the only thing that clears it.
+        terminal_lost = worker_healthy and _lost_its_terminal(result)
+        if terminal_lost:
+            log_event(
+                logger, "warning", "pool.worker.terminal_lost",
+                worker_id=worker.worker_id, account_id=task.account_id,
+                error_code=result.error_code,
+            )
+            worker_healthy = False
+
         self._in_flight.pop(task.task_id, None)
         result.worker_id = worker.worker_id
         worker.release(result)
@@ -348,6 +373,20 @@ class PoolManager:
             self._idle.put_nowait(worker)
         else:
             worker.state = WorkerState.failed
+
+        # A task that died with its worker's terminal has not had its attempt:
+        # it never reached the trade server. Moving it to another worker is not
+        # a retry, so it does not spend the budget - but it is bounded by the
+        # pool size, so a pool where every terminal is gone still gives up.
+        if terminal_lost and item.reassignments < len(self._workers):
+            item.reassignments += 1
+            item.attempts -= 1
+            log_event(
+                logger, "info", "pool.task.reassigning",
+                account_id=task.account_id, reassignments=item.reassignments,
+            )
+            self._queue.put_nowait((item.priority, next(self._sequence), item))
+            return
 
         if self._should_retry(item, result):
             self._queue.put_nowait((item.priority, next(self._sequence), item))

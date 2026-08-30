@@ -19,7 +19,7 @@ _START_LOCK_WAIT_SECONDS = 300.0
 # terminal never came up on the IPC channel at all, which in practice is what a
 # server the terminal has not been configured with looks like: the terminal
 # starts, cannot resolve the server, and never answers.
-_IPC_ERROR_CEILING = -10000
+IPC_ERROR_CEILING = -10000
 _AUTHORIZATION_FAILED = -6
 
 
@@ -32,11 +32,11 @@ class TerminalError(RuntimeError):
     @property
     def is_ipc(self) -> bool:
         """True when the terminal never answered, so its state is unusable."""
-        return self.code is not None and self.code <= _IPC_ERROR_CEILING
+        return self.code is not None and self.code <= IPC_ERROR_CEILING
 
 
 def _diagnose(code: int | None, server: str) -> str:
-    if code is not None and code <= _IPC_ERROR_CEILING:
+    if code is not None and code <= IPC_ERROR_CEILING:
         return (
             f" - the terminal never answered within the timeout, so it never got "
             f"as far as logging in: usually {server!r} is not one of the servers "

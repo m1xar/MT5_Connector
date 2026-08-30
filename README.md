@@ -62,8 +62,8 @@ Four tables are stored: accounts, closed positions, open positions and
 transactions. Sync runs are deliberately not one of them — a sync is either in
 flight, and then `/pool/status` knows about it, or finished, and then its
 outcome is on the account (`last_synced_at`, `status`, `consecutive_failures`,
-`last_error`). The `sync_run_id` in a response is a correlation id for the
-logs, not a row.
+`last_error`). Every log line of one sync still shares a correlation id, but it
+identifies nothing queryable and is not in any response.
 
 ### BalanceInit, the one real difference from cTrader
 
@@ -336,6 +336,17 @@ carries it. A dead IPC channel stays dead for every later call on
 the module, so that case takes the terminal down with it and the next task
 starts a fresh one; a rejected login leaves it usable.
 
+**A dead terminal takes its worker with it.** The MetaTrader5 package is a
+process-global singleton, and once its IPC channel has gone it does not come
+back inside that process: `shutdown()` then `initialize()` returns True without
+relaunching anything, and every later call fails instantly. Killing all six
+terminals under load left the pool reporting six healthy idle workers while
+every sync failed in a tenth of a second. So a transport-level failure now
+retires the worker process rather than just the module, and the task moves to
+another worker without spending a retry - losing a terminal says nothing about
+the account. Bounded by the pool size, so a pool with no live terminals still
+gives up rather than circling.
+
 **Timeouts.** 30s for a routine connect, on a terminal that is already up and
 only switching accounts. 120s for the first sync of a newly added account, which
 also has to start the terminal. Cold starts are the expensive case and they get
@@ -576,5 +587,6 @@ is the reconstruction itself, which needs an account with real trading history:
 5. Check the clock: `GET /accounts/{id}/info` should report a
    `server_utc_offset_minutes` that matches the terminal's own Market Watch
    time, and `ClosedAtUtc` on a position should be that many minutes behind
-   `ClosedAt`. Measured off a live tick, so do this while the market is open —
-   at the weekend it stays at whatever the last weekday sync recorded.
+   `ClosedAt`. It reads off history rather than a live quote, so the weekend is
+   as good a time as any — and a position from the far side of a daylight
+   saving switch will be an hour out, which is known and unfixed.
