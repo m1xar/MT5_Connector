@@ -13,6 +13,7 @@ from repositories.account_repo import AccountRepository
 from repositories.position_repo import OpenPositionRepository, PositionRepository
 from repositories.sync_run_repo import SyncRunRepository
 from repositories.transaction_repo import TransactionRepository
+from utils.config import settings
 from utils.logging import get_logger, log_event, reset_context, set_sync_context
 
 logger = get_logger(__name__)
@@ -28,18 +29,49 @@ class SyncService:
         account: MT5Account,
         kind: SyncKind,
         dedupe: bool = False,
-    ) -> tuple[MT5SyncRun, "asyncio.Future[SyncResult]"]:
+        connect_timeout_ms: int | None = None,
+    ) -> tuple[MT5SyncRun | None, "asyncio.Future[SyncResult]"]:
+        # A deduped request rides on the sync already running, so recording a
+        # second run would leave a row stuck at `queued` for ever - nothing
+        # will ever finish it, because no second task exists.
+        if dedupe:
+            pending = self.pool.pending_for(account.account_id)
+            if pending is not None:
+                log_event(
+                    logger,
+                    "debug",
+                    "sync.request.deduped",
+                    account_id=account.account_id,
+                )
+                return None, pending
+
         run = await SyncRunRepository(session).create(account.account_id, kind)
         await session.commit()
+
+        # Only the parent can see the database, so the list of positions that
+        # already carry an excursion is gathered here and carried to the
+        # worker with the task.
+        already_measured = frozenset(
+            await PositionRepository(session).measured_external_ids(account.account_id)
+        )
 
         future = self.pool.submit(
             account_id=account.account_id,
             login=account.login,
             password=account.password,
             server=account.server,
-            priority=PRIORITY_HARD if kind == SyncKind.hard else PRIORITY_SCHEDULED,
+            priority=(
+                PRIORITY_HARD
+                if kind in (SyncKind.hard, SyncKind.initial)
+                else PRIORITY_SCHEDULED
+            ),
             dedupe=dedupe,
             sync_run_id=run.sync_run_id,
+            connect_timeout_ms=connect_timeout_ms,
+            already_measured=already_measured,
+            # One attempt, on the long timeout it was already given. Three
+            # attempts turned a 120s budget into a 400s wait.
+            max_retries=0 if kind == SyncKind.initial else None,
         )
         return run, future
 
@@ -76,7 +108,12 @@ class SyncService:
             return
 
         if not result.ok or result.payload is None:
-            await account_repo.mark_error(account, result.error or "unknown error")
+            await account_repo.mark_error(
+                account,
+                result.error or "unknown error",
+                initial=run is not None and run.kind == SyncKind.initial,
+                threshold=settings.account_error_threshold,
+            )
             if run is not None:
                 await run_repo.finish(
                     run,

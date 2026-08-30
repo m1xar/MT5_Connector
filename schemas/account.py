@@ -33,6 +33,7 @@ class AccountResponse(BaseModel):
     owner_id: Optional[str]
     enabled: bool
     status: AccountStatus
+    consecutive_failures: int
     balance: float
     equity: float
     leverage: int
@@ -57,6 +58,7 @@ def account_to_response(account: MT5Account) -> AccountResponse:
         owner_id=account.owner_id,
         enabled=account.enabled,
         status=account.status,
+        consecutive_failures=account.consecutive_failures,
         balance=account.balance,
         equity=account.equity,
         leverage=account.leverage,

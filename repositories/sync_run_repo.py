@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -50,12 +50,3 @@ class SyncRunRepository:
         await self.session.flush()
         await self.session.refresh(run)
         return run
-
-    async def list_for_account(self, account_id: str, limit: int = 20) -> List[MT5SyncRun]:
-        result = await self.session.execute(
-            select(MT5SyncRun)
-            .where(MT5SyncRun.account_id == account_id)
-            .order_by(MT5SyncRun.started_at.desc())
-            .limit(limit)
-        )
-        return list(result.scalars().all())

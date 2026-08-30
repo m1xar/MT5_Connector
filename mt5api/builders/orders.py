@@ -5,6 +5,25 @@ from domain import fx
 from .. import raw
 from ..helpers.mathutil import abs8, round8
 
+_ORDER_TYPES = {
+    raw.ORDER_TYPE_BUY: fx.ORDER_TYPE_MARKET,
+    raw.ORDER_TYPE_SELL: fx.ORDER_TYPE_MARKET,
+    raw.ORDER_TYPE_CLOSE_BY: fx.ORDER_TYPE_MARKET,
+    raw.ORDER_TYPE_BUY_LIMIT: fx.ORDER_TYPE_LIMIT,
+    raw.ORDER_TYPE_SELL_LIMIT: fx.ORDER_TYPE_LIMIT,
+    raw.ORDER_TYPE_BUY_STOP: fx.ORDER_TYPE_STOP,
+    raw.ORDER_TYPE_SELL_STOP: fx.ORDER_TYPE_STOP,
+    raw.ORDER_TYPE_BUY_STOP_LIMIT: fx.ORDER_TYPE_STOP_LIMIT,
+    raw.ORDER_TYPE_SELL_STOP_LIMIT: fx.ORDER_TYPE_STOP_LIMIT,
+}
+
+_ORDER_STATES = {
+    raw.ORDER_STATE_FILLED: fx.ORDER_STATUS_FILLED,
+    raw.ORDER_STATE_REJECTED: fx.ORDER_STATUS_REJECTED,
+    raw.ORDER_STATE_EXPIRED: fx.ORDER_STATUS_EXPIRED,
+    raw.ORDER_STATE_CANCELED: fx.ORDER_STATUS_CANCELLED,
+}
+
 
 def trade_side(deal_type: int) -> str:
     return fx.SIDE_LONG if deal_type == raw.DEAL_TYPE_BUY else fx.SIDE_SHORT
@@ -14,47 +33,23 @@ def execution_side(deal_type: int) -> str:
     return fx.EXEC_SIDE_BUY if deal_type == raw.DEAL_TYPE_BUY else fx.EXEC_SIDE_SELL
 
 
-def order_execution_side(order_type: int) -> str:
-    return fx.EXEC_SIDE_BUY if order_type % 2 == 0 else fx.EXEC_SIDE_SELL
-
-
 def order_type(order: raw.RawOrder | None) -> str:
     if order is None:
         return fx.ORDER_TYPE_MARKET
-    if order.type in (raw.ORDER_TYPE_BUY, raw.ORDER_TYPE_SELL, raw.ORDER_TYPE_CLOSE_BY):
-        return fx.ORDER_TYPE_MARKET
-    if order.type in (raw.ORDER_TYPE_BUY_LIMIT, raw.ORDER_TYPE_SELL_LIMIT):
-        return fx.ORDER_TYPE_LIMIT
-    if order.type in (raw.ORDER_TYPE_BUY_STOP, raw.ORDER_TYPE_SELL_STOP):
-        return fx.ORDER_TYPE_STOP
-    if order.type in (raw.ORDER_TYPE_BUY_STOP_LIMIT, raw.ORDER_TYPE_SELL_STOP_LIMIT):
-        return fx.ORDER_TYPE_STOP_LIMIT
-    return fx.ORDER_TYPE_MARKET
+    return _ORDER_TYPES.get(order.type, fx.ORDER_TYPE_MARKET)
 
 
-def order_status(state: int) -> str:
-    if state == raw.ORDER_STATE_FILLED:
-        return fx.ORDER_STATUS_FILLED
-    if state == raw.ORDER_STATE_REJECTED:
-        return fx.ORDER_STATUS_REJECTED
-    if state == raw.ORDER_STATE_EXPIRED:
-        return fx.ORDER_STATUS_EXPIRED
-    if state == raw.ORDER_STATE_CANCELED:
-        return fx.ORDER_STATUS_CANCELLED
-    return fx.ORDER_STATUS_ACCEPTED
-
-
-def _filled_order_status(order: raw.RawOrder | None, deal: raw.RawDeal | None) -> str:
-    if deal is not None:
-        return fx.ORDER_STATUS_FILLED
-    if order is None:
+def _order_status(order: raw.RawOrder | None, deal: raw.RawDeal | None) -> str:
+    """A deal is proof of a fill, whatever the order record says."""
+    if deal is not None or order is None:
         return fx.ORDER_STATUS_FILLED
     if order.volume_initial > order.volume_current:
         return fx.ORDER_STATUS_FILLED
-    return order_status(order.state)
+    return _ORDER_STATES.get(order.state, fx.ORDER_STATUS_ACCEPTED)
 
 
-def _stop_and_original_price(order: raw.RawOrder) -> tuple[float, float]:
+def _prices(order: raw.RawOrder) -> tuple[float, float]:
+    """Stop price and original price, as the cTrader shape splits them."""
     kind = order_type(order)
     if kind == fx.ORDER_TYPE_STOP_LIMIT:
         return order.price_open, order.price_stoplimit
@@ -82,47 +77,52 @@ def build_orders(
     deals: list[raw.RawDeal],
     position_id: str,
 ) -> list[fx.FXOrder]:
-    deal_by_order: dict[int, raw.RawDeal] = {}
-    for deal in deals:
-        if deal.order:
-            deal_by_order[deal.order] = deal
+    deal_by_order = {deal.order: deal for deal in deals if deal.order}
 
-    out: list[fx.FXOrder] = []
+    built: list[fx.FXOrder] = []
     for order in orders:
         deal = deal_by_order.get(order.ticket)
         order_id = str(order.ticket)
-        stop_price, original_price = _stop_and_original_price(order)
+        stop_price, original_price = _prices(order)
 
-        average_price = deal.price if deal is not None else order.price_open
-        if deal is not None:
-            amount_filled = deal.volume
-        else:
-            amount_filled = max(order.volume_initial - order.volume_current, 0.0)
-
-        domain_order = fx.FXOrder(
-            id=order_id,
-            position_id=position_id,
-            type=order_type(order),
-            status=_filled_order_status(order, deal),
-            side=execution_side(deal.type) if deal is not None else order_execution_side(order.type),
-            amount=order.volume_initial,
-            amount_filled=amount_filled,
-            average_price=average_price,
-            stop_price=stop_price,
-            original_price=original_price,
-            updated_at=order.time_done or order.time_setup,
+        built.append(
+            fx.FXOrder(
+                id=order_id,
+                position_id=position_id,
+                type=order_type(order),
+                status=_order_status(order, deal),
+                side=(
+                    execution_side(deal.type)
+                    if deal is not None
+                    # MT5 numbers order types in buy/sell pairs, evens buying.
+                    else (fx.EXEC_SIDE_BUY if order.type % 2 == 0 else fx.EXEC_SIDE_SELL)
+                ),
+                amount=order.volume_initial,
+                amount_filled=(
+                    deal.volume
+                    if deal is not None
+                    else max(order.volume_initial - order.volume_current, 0.0)
+                ),
+                average_price=deal.price if deal is not None else order.price_open,
+                stop_price=stop_price,
+                original_price=original_price,
+                updated_at=order.time_done or order.time_setup,
+                trade=build_trade(deal, order_id) if deal is not None else fx.FXTrade(),
+            )
         )
-        if deal is not None:
-            domain_order.trade = build_trade(deal, order_id)
-        out.append(domain_order)
-    return out
+    return built
 
 
 def build_orders_from_deals(deals: list[raw.RawDeal], position_id: str) -> list[fx.FXOrder]:
-    out: list[fx.FXOrder] = []
+    """A stand-in when the order history no longer covers the position.
+
+    Brokers age out orders sooner than deals, so an old position can arrive
+    with deals and no orders at all. The deals still say what was executed.
+    """
+    built: list[fx.FXOrder] = []
     for deal in deals:
         order_id = str(deal.order or deal.ticket)
-        out.append(
+        built.append(
             fx.FXOrder(
                 id=order_id,
                 position_id=position_id,
@@ -136,4 +136,4 @@ def build_orders_from_deals(deals: list[raw.RawDeal], position_id: str) -> list[
                 trade=build_trade(deal, order_id),
             )
         )
-    return out
+    return built

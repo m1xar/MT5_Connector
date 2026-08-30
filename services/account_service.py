@@ -60,18 +60,20 @@ class AccountService:
     ) -> MT5Account:
         if password is not None:
             account.password = password
+            # Fresh credentials are a fresh chance. Without this an account
+            # that struck out would stay skipped by the scheduler even after
+            # the very thing that broke it was fixed.
+            account.status = AccountStatus.active
+            account.consecutive_failures = 0
+            account.last_error = None
         if broker is not None:
             account.broker = broker
         if label is not None:
             account.label = label
         if enabled is not None:
+            # `enabled` decides whether the scheduler picks the account up;
+            # `status` only ever reports whether the connection works.
             account.enabled = enabled
-            if not enabled:
-                account.status = AccountStatus.disabled
-            elif account.status == AccountStatus.disabled:
-                account.status = (
-                    AccountStatus.active if account.last_synced_at else AccountStatus.pending
-                )
 
         updated = await self.repo.update(account)
         await self.session.commit()

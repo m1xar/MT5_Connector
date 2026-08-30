@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from domain import fx
 from domain.models import MT5OpenPosition, MT5Position, MT5Transaction
-from mt5api.api import balance_snapshots
+from mt5api.builders.balance_snapshots import build_balance_snapshots
 from mt5api.helpers.timeutil import cutoff_from_days
 from repositories.position_repo import OpenPositionRepository, PositionRepository
 from repositories.transaction_repo import TransactionRepository
@@ -97,4 +97,6 @@ class QueryService:
         days: int | None = None,
     ) -> List[fx.UserBalanceSnapshot]:
         rows = await PositionRepository(self.session).list_all(account_id)
-        return balance_snapshots([position_to_fx(row) for row in rows], days=days)
+        return build_balance_snapshots(
+            [position_to_fx(row) for row in rows], days=days
+        )

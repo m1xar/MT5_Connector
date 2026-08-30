@@ -36,6 +36,10 @@ _POSITION_FIELDS = (
     "closed_at",
 )
 
+# Only new positions get priced, so a sync carries no MAE/MFE for the ones it
+# skipped. That absence must not wipe what was measured earlier.
+_KEPT_WHEN_ABSENT = frozenset({"mae", "mfe"})
+
 
 def _orders_json(position: fx.FXPosition | fx.FXOpenPosition) -> list[dict]:
     return [order.model_dump(by_alias=True, mode="json") for order in position.orders]
@@ -57,11 +61,27 @@ class PositionRepository:
                 row = MT5Position(account_id=account_id, external_id=position.id)
                 self.session.add(row)
             for field_name in _POSITION_FIELDS:
-                setattr(row, field_name, getattr(position, field_name))
+                value = getattr(position, field_name)
+                if (
+                    value is None
+                    and field_name in _KEPT_WHEN_ABSENT
+                    and getattr(row, field_name) is not None
+                ):
+                    continue
+                setattr(row, field_name, value)
             row.orders = _orders_json(position)
             row.synced_at = now
         await self.session.flush()
         return len(positions)
+
+    async def measured_external_ids(self, account_id: str) -> set[str]:
+        """Positions that already carry an excursion, so need no candles."""
+        result = await self.session.execute(
+            select(MT5Position.external_id)
+            .where(MT5Position.account_id == account_id)
+            .where(MT5Position.mae != None)  # noqa: E711
+        )
+        return set(result.scalars().all())
 
     async def _existing_by_external_id(self, account_id: str) -> dict[str, MT5Position]:
         result = await self.session.execute(

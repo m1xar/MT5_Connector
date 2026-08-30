@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import Column, DateTime, UniqueConstraint
+from sqlalchemy import BigInteger, Column, DateTime, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.types import JSON
 from sqlmodel import Field, SQLModel
@@ -11,7 +11,6 @@ from sqlmodel import Field, SQLModel
 from utils.id import new_id
 
 from .enums import AccountStatus, SyncKind, SyncStatus
-from .fx import UserBalanceSnapshot
 
 _JSON = JSON().with_variant(JSONB(), "postgresql")
 
@@ -31,7 +30,8 @@ class MT5Account(SQLModel, table=True):
     __table_args__ = (UniqueConstraint("login", "server", name="uq_mt5account_login_server"),)
 
     account_id: str = Field(default_factory=new_id, primary_key=True)
-    login: int = Field(index=True)
+    # MT5 login numbers run to ten digits, past the 2^31 an INTEGER holds.
+    login: int = Field(sa_column=Column(BigInteger, index=True, nullable=False))
     password: str = Field()
     server: str = Field(index=True)
     broker: Optional[str] = Field(default=None)
@@ -39,7 +39,8 @@ class MT5Account(SQLModel, table=True):
     owner_id: Optional[str] = Field(default=None, index=True)
 
     enabled: bool = Field(default=True, index=True)
-    status: AccountStatus = Field(default=AccountStatus.pending, index=True)
+    status: AccountStatus = Field(default=AccountStatus.active, index=True)
+    consecutive_failures: int = Field(default=0)
 
     balance: float = Field(default=0.0)
     equity: float = Field(default=0.0)

@@ -1,20 +1,11 @@
 from __future__ import annotations
 
+import time
+
 from utils.logging import get_logger, log_event
 
-from datetime import datetime
-
 from .helpers.timeutil import as_naive_utc, history_range
-from .raw import (
-    TIMEFRAME_D1,
-    TIMEFRAME_M1,
-    RawAccount,
-    RawCandle,
-    RawDeal,
-    RawHistory,
-    RawOrder,
-    RawPosition,
-)
+from .raw import RawAccount, RawDeal, RawHistory, RawOrder, RawPosition
 from .terminal import MT5Terminal, TerminalError
 
 logger = get_logger(__name__)
@@ -56,29 +47,87 @@ def fetch_open_orders(terminal: MT5Terminal) -> list[RawOrder]:
     return [RawOrder.from_mt5(row) for row in rows]
 
 
-_TIMEFRAMES = {"1m": TIMEFRAME_M1, "1d": TIMEFRAME_D1}
+# How long a zero deal count is allowed to be the real answer before it is
+# believed, and how many identical reads settle a non-zero one.
+_ZERO_SETTLE_SECONDS = 5.0
+_SETTLE_POLL_SECONDS = 1.0
+_SETTLE_STABLE_READS = 2
 
 
-def fetch_candles(
+def wait_for_history(
     terminal: MT5Terminal,
-    symbol: str,
-    interval: str,
-    start: datetime,
-    end: datetime,
-) -> list[RawCandle]:
-    timeframe = _TIMEFRAMES[interval]
-    terminal.mt5.symbol_select(symbol, True)
-    rows = terminal.check_call(
-        terminal.mt5.copy_rates_range(
-            symbol, timeframe, as_naive_utc(start), as_naive_utc(end)
-        ),
-        "copy_rates_range",
+    account: RawAccount,
+    *,
+    timeout_seconds: float = 30.0,
+) -> int:
+    """Block until the terminal has finished pulling this account's history.
+
+    ``login()`` returns before that download does. On a real account
+    ``history_deals_total`` reads 0 for the first seconds and then jumps to the
+    true figure - measured at 0 deals on return and 188 two seconds later.
+    Reading in that window reconstructs an empty account, and worse, the ledger
+    derives ``BalanceInit`` from a balance with no deals to explain it, so the
+    damage is silently wrong numbers rather than a failure.
+
+    A funded account cannot have zero deals - the deposit is itself a deal - so
+    a zero count against a non-zero balance means the download is still in
+    flight. An account that really is empty settles at zero and costs a few
+    seconds.
+    """
+    start, end = history_range(None)
+    start, end = as_naive_utc(start), as_naive_utc(end)
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+
+    previous: int | None = None
+    stable = 0
+    while True:
+        total = terminal.mt5.history_deals_total(start, end)
+        if total == previous:
+            stable += 1
+        else:
+            previous, stable = total, 1
+
+        if total > 0 and stable >= _SETTLE_STABLE_READS:
+            break
+        # Zero is only believed once the account has had a fair chance to
+        # produce something, and never on an account that holds money.
+        if total == 0 and not account.balance:
+            if time.monotonic() - started >= _ZERO_SETTLE_SECONDS:
+                break
+
+        if time.monotonic() >= deadline:
+            if total > 0:
+                break
+            if account.balance:
+                raise TerminalError(
+                    f"no deal history arrived for {account.login} in "
+                    f"{timeout_seconds:.0f}s, yet the account holds "
+                    f"{account.balance} {account.currency} - the terminal is "
+                    f"still downloading, or the history is unavailable"
+                )
+            break
+
+        time.sleep(_SETTLE_POLL_SECONDS)
+
+    log_event(
+        logger,
+        "info",
+        "terminal.history.settled",
+        login=account.login,
+        deals=total,
+        waited_ms=int((time.monotonic() - started) * 1000),
     )
-    return [RawCandle.from_mt5(row) for row in rows]
+    return total
 
 
-def fetch_history(terminal: MT5Terminal) -> RawHistory:
+def fetch_history(
+    terminal: MT5Terminal,
+    *,
+    settle_timeout_seconds: float = 30.0,
+) -> RawHistory:
     account = fetch_account(terminal)
+    wait_for_history(terminal, account, timeout_seconds=settle_timeout_seconds)
     deals = fetch_deals(terminal)
     orders = fetch_orders(terminal)
     open_positions = fetch_open_positions(terminal)

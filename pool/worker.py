@@ -3,9 +3,10 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from mt5api.api import build_sync_payload
+from mt5api.payload import build_sync_payload
 from mt5api.enrichment import enrich_mae_mfe
-from mt5api.executors import fetch_candles, fetch_history
+from mt5api.candles import fetch_candles
+from mt5api.executors import fetch_history
 from mt5api.terminal import MT5Terminal, TerminalError
 from utils.logging import configure_logging, duration_ms_since, get_logger, log_event
 
@@ -24,6 +25,9 @@ def worker_main(
     log_level: str,
     log_json: bool,
     with_mae_mfe: bool = True,
+    portable: bool = False,
+    history_settle_timeout_seconds: float = 30.0,
+    start_lock: Any = None,
 ) -> None:
     configure_logging(log_level, log_json)
 
@@ -31,21 +35,13 @@ def worker_main(
         terminal_path,
         init_timeout_ms=init_timeout_ms,
         login_timeout_ms=login_timeout_ms,
+        portable=portable,
+        start_lock=start_lock,
     )
-    try:
-        terminal.initialize()
-    except TerminalError as exc:
-        log_event(
-            logger,
-            "error",
-            "worker.initialize.failed",
-            worker_id=worker_id,
-            terminal_path=terminal_path,
-            error=str(exc),
-        )
-        connection.send(WorkerReady(worker_id=worker_id, ok=False, error=str(exc)))
-        return
 
+    # The terminal is not started here. It cannot be: a terminal that has never
+    # logged in sits on its account wizard and never answers the IPC channel, so
+    # it only comes up once there is a task to supply credentials.
     connection.send(WorkerReady(worker_id=worker_id, ok=True))
     log_event(logger, "info", "worker.started", worker_id=worker_id, terminal_path=terminal_path)
 
@@ -57,7 +53,15 @@ def worker_main(
                 break
             if task is None:
                 break
-            connection.send(_run_task(terminal, worker_id, task, with_mae_mfe))
+            connection.send(
+                _run_task(
+                    terminal,
+                    worker_id,
+                    task,
+                    with_mae_mfe,
+                    history_settle_timeout_seconds,
+                )
+            )
     finally:
         terminal.shutdown()
         log_event(logger, "info", "worker.stopped", worker_id=worker_id)
@@ -68,20 +72,36 @@ def _run_task(
     worker_id: str,
     task: SyncTask,
     with_mae_mfe: bool = True,
+    history_settle_timeout_seconds: float = 30.0,
 ) -> SyncResult:
     started = time.perf_counter()
     try:
-        terminal.login(task.login, task.password, task.server)
-        payload = build_sync_payload(fetch_history(terminal))
+        terminal.connect(
+            task.login,
+            task.password,
+            task.server,
+            timeout_ms=task.connect_timeout_ms,
+        )
+        payload = build_sync_payload(
+            fetch_history(
+                terminal, settle_timeout_seconds=history_settle_timeout_seconds
+            )
+        )
         if with_mae_mfe:
             enrich_mae_mfe(
                 payload.positions,
                 lambda symbol, interval, start, end: fetch_candles(
                     terminal, symbol, interval, start, end
                 ),
+                already_measured=task.already_measured,
             )
     except TerminalError as exc:
-        terminal.forget_login()
+        # A dead IPC channel stays dead for every later call on this module, so
+        # the terminal has to go with it; a rejected login leaves it usable.
+        if exc.is_ipc:
+            terminal.reset()
+        else:
+            terminal.forget_login()
         log_event(
             logger,
             "warning",

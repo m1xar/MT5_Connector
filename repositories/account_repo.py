@@ -53,6 +53,11 @@ class AccountRepository:
         statement = (
             select(MT5Account)
             .where(MT5Account.enabled == True)
+            # An account that has never connected is due on every single
+            # tick, so leaving broken ones in would let one bad server name
+            # occupy the whole pool forever. They come back on an explicit
+            # sync, or when their credentials are updated.
+            .where(MT5Account.status != AccountStatus.error_connection)
             .where(
                 (MT5Account.last_synced_at == None)
                 | (MT5Account.last_synced_at < threshold)
@@ -84,13 +89,29 @@ class AccountRepository:
         account.leverage = leverage
         account.currency = currency
         account.status = AccountStatus.active
+        account.consecutive_failures = 0
         account.last_error = None
         account.last_synced_at = utc_now()
         return await self.update(account)
 
-    async def mark_error(self, account: MT5Account, error: str) -> MT5Account:
-        account.status = AccountStatus.error
+    async def mark_error(
+        self,
+        account: MT5Account,
+        error: str,
+        *,
+        initial: bool = False,
+        threshold: int = 3,
+    ) -> MT5Account:
+        """Count the failure, and flip the status once it stops looking like a blip.
+
+        A failed *first* sync is conclusive on its own: the account was only
+        just added and has never once connected, so there is no run of
+        successes for this to be a blip in.
+        """
+        account.consecutive_failures += 1
         account.last_error = error
+        if initial or account.consecutive_failures >= threshold:
+            account.status = AccountStatus.error_connection
         return await self.update(account)
 
     async def delete(self, account: MT5Account) -> None:

@@ -29,6 +29,12 @@ class SyncTask:
     password: str
     server: str
     sync_run_id: Optional[str] = None
+    # Overrides the worker default; the first sync of a new account gets a
+    # longer one because that connection has never been proven to work.
+    connect_timeout_ms: Optional[int] = None
+    # Positions whose MAE/MFE is already stored; the worker skips pricing
+    # them rather than re-fetching candles from years ago.
+    already_measured: frozenset = frozenset()
 
 
 @dataclass(slots=True)

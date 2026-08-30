@@ -28,20 +28,48 @@ def candle_high_low(candles: list[RawCandle]) -> tuple[float | None, float | Non
     return high, low
 
 
+# How far the candles may sit from the prices the position actually traded at
+# before they are treated as belonging to some other period entirely. As a
+# fraction of the price, so it means the same on EURUSD as on USDJPY.
+_OVERLAP_TOLERANCE = 0.01
+
+
 def apply_fx_mae_mfe(
     position: fx.FXPosition,
     high: float | None,
     low: float | None,
-) -> None:
+) -> bool:
+    """Set the excursion, and report whether the candles could support one."""
     if high is None or low is None:
-        return
+        return False
+
+    traded_low = min(position.entry_price, position.exit_price)
+    traded_high = max(position.entry_price, position.exit_price)
+
+    # Candles from the wrong period do not straddle the prices the position
+    # dealt at. That is the check worth keeping: a single stray bar from years
+    # later once turned a 0.01 lot EURUSD position into a 161 EUR excursion on
+    # a 109 EUR account.
+    slack = traded_high * _OVERLAP_TOLERANCE
+    if low > traded_high + slack or high < traded_low - slack:
+        return False
+
+    # The fills belong to the range the position lived through, and they are
+    # not always inside the bars: candles are bid, while a short is closed at
+    # the ask, so its exit sits a spread above the bid high. Folding them in
+    # keeps MAE <= Pnl <= MFE true by construction instead of discarding
+    # perfectly good positions over one or two pips of spread.
+    high = max(high, traded_high)
+    low = min(low, traded_low)
+
     unit = value_per_price_unit(position)
     if position.side == fx.SIDE_LONG:
         position.mae = round8(min(0.0, (low - position.entry_price) * unit))
         position.mfe = round8(max(0.0, (high - position.entry_price) * unit))
-        return
-    position.mae = round8(min(0.0, (position.entry_price - high) * unit))
-    position.mfe = round8(max(0.0, (position.entry_price - low) * unit))
+    else:
+        position.mae = round8(min(0.0, (position.entry_price - high) * unit))
+        position.mfe = round8(max(0.0, (position.entry_price - low) * unit))
+    return True
 
 
 def apply_rr(position: fx.FXPosition) -> None:

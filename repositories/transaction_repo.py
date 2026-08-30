@@ -9,12 +9,12 @@ from sqlmodel import select
 
 from domain import fx
 from domain.models import MT5Transaction, utc_now
-from utils.logging import hash_value
+from utils.hashing import stable_hash
 
 
 def transaction_fingerprint(transaction: fx.Transaction) -> str:
     stamp = transaction.time.isoformat() if transaction.time else ""
-    return hash_value(f"{stamp}|{transaction.type}|{transaction.amount:.8f}")
+    return stable_hash(f"{stamp}|{transaction.type}|{transaction.amount:.8f}")
 
 
 class TransactionRepository:

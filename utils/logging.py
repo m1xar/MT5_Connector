@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextvars
-import hashlib
 import json
 import logging
 import sys
@@ -113,32 +112,6 @@ def log_event(
 
 def duration_ms_since(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
-
-
-def safe_preview(value: Any, max_chars: int = 200) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        text = value
-    else:
-        try:
-            text = json.dumps(value, ensure_ascii=True, default=str)
-        except Exception:
-            text = str(value)
-    text = " ".join(text.split())
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + "...[truncated]"
-
-
-def hash_value(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        text = value
-    else:
-        text = json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 def set_request_context(
