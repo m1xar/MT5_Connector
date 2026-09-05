@@ -78,7 +78,7 @@ def wait_for_history(terminal: MT5Terminal, account: RawAccount, *, timeout_seco
     previous: int | None = None
     stable = 0
     while True:
-        total = terminal.mt5.history_deals_total(start, end)
+        total = terminal.mt5.history_deals_total(start, end) or 0
         if total == previous:
             stable += 1
         else:
