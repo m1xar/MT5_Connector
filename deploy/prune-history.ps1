@@ -15,17 +15,31 @@
   MAE/MFE once: later syncs skip positions that already carry a figure, so the
   deep history behind them is never asked for again.
 
+  The service does this itself after every sync, for the instance that ran it
+  (MT5_API_PRUNE_CACHE_AFTER_SYNC). This script is what is left for the cases
+  it cannot reach: an instance the pool is not currently syncing through, a
+  one-off reclaim with the pool stopped, or a dry run to see the size first.
+
       .\prune-history.ps1                 # report only, delete nothing
       .\prune-history.ps1 -Apply          # keep this year and last
       .\prune-history.ps1 -Apply -KeepYears 1
+
+  -Root is optional; without it the pool root comes from .env. See _root.ps1.
 #>
 param(
     [switch]$Apply,
     [int]$KeepYears = 2,
-    [string]$Root = "D:\MT5"
+    [string]$Root
 )
 
 $ErrorActionPreference = "Stop"
+
+. "$PSScriptRoot\_root.ps1"
+$Root = Resolve-MT5Root $Root
+
+# Enumerating a root that is not there reports 0 MB freed, which reads as "the
+# cache was already clean" rather than "this looked in the wrong place".
+if (-not (Test-Path $Root)) { throw "terminal root not found at $Root" }
 
 $cutoff = (Get-Date).Year - $KeepYears + 1
 Write-Host ("Keeping history from $cutoff onwards" +

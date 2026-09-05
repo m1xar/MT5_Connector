@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from utils.logging import get_logger, log_event
+from utils.logging import log_event
 
-from .protocol import SyncResult, SyncTask, WorkerReady, WorkerState, WorkerStatus
+from .protocol import SyncResult, SyncTask, WorkerState, WorkerStatus
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _RESTART_ATTEMPTS = 3
 _RESTART_BACKOFF_SECONDS = 5.0
-# How long a worker gets to close its terminal before it is killed outright.
 _GRACEFUL_STOP_SECONDS = 5.0
 _TERMINATE_JOIN_SECONDS = 10.0
 _KILL_JOIN_SECONDS = 5.0
@@ -21,13 +21,6 @@ _KILL_JOIN_SECONDS = 5.0
 
 @dataclass
 class WorkerHandle:
-    """One worker process, and everything about keeping it alive.
-
-    The pool decides *what* runs; this decides *where*. Spawning, the pipe, the
-    restart ladder and the counters all belong to one process, so they live
-    together rather than being spread through the dispatcher.
-    """
-
     worker_id: str
     terminal_path: str
     mp_context: Any
@@ -46,9 +39,6 @@ class WorkerHandle:
     last_error: Optional[str] = None
 
     async def spawn(self) -> bool:
-        # Starting a process can fail outright - the OS refuses, or the target
-        # will not pickle. Reported like any other failed start, because the
-        # caller is a restart ladder that has to keep its footing.
         try:
             parent_conn, child_conn = self.mp_context.Pipe()
             process = self.mp_context.Process(
@@ -61,25 +51,17 @@ class WorkerHandle:
             process.start()
             child_conn.close()
         except Exception as exc:
-            return await self._start_failed(
-                f"worker would not spawn: {type(exc).__name__}: {exc}"
-            )
+            return await self._start_failed(f"worker would not spawn: {type(exc).__name__}: {exc}")
 
         self.process = process
         self.connection = parent_conn
         self.state = WorkerState.starting
-
         try:
-            ready: WorkerReady = await asyncio.wait_for(
-                asyncio.to_thread(parent_conn.recv),
-                timeout=self.start_timeout_seconds,
-            )
+            ready = await asyncio.wait_for(asyncio.to_thread(parent_conn.recv), timeout=self.start_timeout_seconds)
         except (asyncio.TimeoutError, EOFError, OSError) as exc:
             return await self._start_failed(f"worker did not start: {exc}")
-
-        if not ready.ok:
-            return await self._start_failed(ready.error or "worker reported not ready")
-
+        if ready != self.worker_id:
+            return await self._start_failed(f"worker reported {ready!r} instead of ready")
         self.last_error = None
         return True
 
@@ -87,10 +69,7 @@ class WorkerHandle:
         await self.terminate()
         for attempt in range(1, _RESTART_ATTEMPTS + 1):
             self.restarts += 1
-            log_event(
-                logger, "info", "pool.worker.restarting",
-                worker_id=self.worker_id, attempt=attempt,
-            )
+            log_event(logger, "info", "pool.worker.restarting", worker_id=self.worker_id, attempt=attempt)
             if await self.spawn():
                 return True
             await asyncio.sleep(_RESTART_BACKOFF_SECONDS * attempt)
@@ -101,8 +80,6 @@ class WorkerHandle:
         process, connection = self.process, self.connection
         self.process, self.connection = None, None
 
-        # Ask the worker to stop before killing it. Only the worker can close
-        # its terminal, and a killed process leaves terminal64.exe running.
         if connection is not None and process is not None:
             try:
                 if process.is_alive():
@@ -110,7 +87,6 @@ class WorkerHandle:
                     await asyncio.to_thread(process.join, _GRACEFUL_STOP_SECONDS)
             except Exception:
                 pass
-
         if connection is not None:
             try:
                 connection.close()
@@ -126,15 +102,9 @@ class WorkerHandle:
                 process.kill()
                 await asyncio.to_thread(process.join, _KILL_JOIN_SECONDS)
         except Exception as exc:
-            log_event(
-                logger, "warning", "pool.worker.terminate_failed",
-                worker_id=self.worker_id, error=str(exc),
-            )
+            log_event(logger, "warning", "pool.worker.terminate_failed", worker_id=self.worker_id, error=str(exc))
 
     async def roundtrip(self, task: SyncTask) -> SyncResult:
-        # A handle torn down between dispatch and here has no pipe. Saying so
-        # as a ConnectionError puts it in the same bucket as any other lost
-        # worker, instead of an AttributeError nobody catches.
         connection = self.connection
         if connection is None:
             raise ConnectionError(f"worker {self.worker_id} has no open pipe")

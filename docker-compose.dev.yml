@@ -1,0 +1,34 @@
+# Local development database. The service itself runs on the host - it needs
+# the MetaTrader5 terminals, which are Windows processes.
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#
+# Tables are created at startup by SQLModel; there are no migrations, so a
+# schema change means dropping the volume:
+#
+#   docker compose -f docker-compose.dev.yml down -v
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: mt5_api_pg
+    restart: unless-stopped
+    # The API may open up to 80 connections (MT5_API_DB_POOL_SIZE +
+    # MT5_API_DB_MAX_OVERFLOW); the default 100 leaves too little for psql.
+    command: postgres -c max_connections=200
+    environment:
+      POSTGRES_USER: mt5_api
+      POSTGRES_PASSWORD: mt5_api_pass
+      POSTGRES_DB: mt5_api
+    ports:
+      - "5432:5432"
+    volumes:
+      - mt5_api_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mt5_api -d mt5_api"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mt5_api_pgdata:

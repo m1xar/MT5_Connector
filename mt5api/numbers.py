@@ -10,11 +10,7 @@ def abs8(value: float) -> float:
 
 
 def weighted_price(items: list[tuple[float, float]]) -> float:
-    total_volume = 0.0
-    weighted = 0.0
-    for volume, price in items:
-        total_volume += volume
-        weighted += volume * price
+    total_volume = sum(volume for volume, _ in items)
     if total_volume == 0:
         return 0.0
-    return weighted / total_volume
+    return sum(volume * price for volume, price in items) / total_volume

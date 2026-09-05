@@ -5,8 +5,7 @@ from fastapi import APIRouter, Depends, Request
 from pool.manager import PoolManager
 from schemas.pool import HealthResponse, PoolStatusResponse, pool_status_to_response
 
-from ..auth import verify_auth
-from ..runtime import COMMON_RESPONSES, get_pool
+from ..deps import COMMON_RESPONSES, get_pool, verify_auth
 
 router = APIRouter(tags=["Pool"])
 
@@ -17,11 +16,9 @@ router = APIRouter(tags=["Pool"])
     summary="Terminal pool state",
     description="Per-worker state plus how deep the sync queue is.",
     responses=COMMON_RESPONSES,
+    dependencies=[Depends(verify_auth)],
 )
-async def get_pool_status(
-    terminal_pool: PoolManager = Depends(get_pool),
-    _auth: str | None = Depends(verify_auth),
-):
+async def get_pool_status(terminal_pool: PoolManager = Depends(get_pool)):
     return pool_status_to_response(terminal_pool.status())
 
 
@@ -39,16 +36,12 @@ async def healthz(request: Request):
     pool: PoolManager | None = getattr(request.app.state, "pool", None)
     if pool is None:
         return HealthResponse(status="starting", healthy_workers=0, worker_count=0)
-    workers = pool.status().workers
+    worker_count = len(pool.status().workers)
     healthy = pool.healthy_workers
     if not pool.dispatcher_alive:
         status = "stalled"
-    elif healthy == len(workers):
+    elif healthy == worker_count:
         status = "ok"
     else:
         status = "degraded"
-    return HealthResponse(
-        status=status,
-        healthy_workers=healthy,
-        worker_count=len(workers),
-    )
+    return HealthResponse(status=status, healthy_workers=healthy, worker_count=worker_count)

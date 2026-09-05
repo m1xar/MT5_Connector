@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from domain.enums import AccountStatus
@@ -7,9 +9,9 @@ from domain.models import MT5Account
 from repositories.account_repo import AccountRepository
 from repositories.position_repo import OpenPositionRepository, PositionRepository
 from repositories.transaction_repo import TransactionRepository
-from utils.logging import get_logger, log_event
+from utils.logging import log_event
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class AccountExistsError(ValueError):
@@ -21,60 +23,24 @@ class AccountService:
         self.session = session
         self.repo = AccountRepository(session)
 
-    async def create(
-        self,
-        *,
-        login: int,
-        password: str,
-        server: str,
-        broker: str | None = None,
-        label: str | None = None,
-        owner_id: str | None = None,
-    ) -> MT5Account:
-        existing = await self.repo.get_by_login(login, server)
-        if existing is not None:
+    async def create(self, *, login: int, password: str, server: str) -> MT5Account:
+        if await self.repo.get_by_login(login, server) is not None:
             raise AccountExistsError(f"account {login}@{server} already exists")
-
-        account = await self.repo.create(
-            MT5Account(
-                login=login,
-                password=password,
-                server=server,
-                broker=broker,
-                label=label,
-                owner_id=owner_id,
-            )
-        )
+        account = await self.repo.create(MT5Account(login=login, password=password, server=server))
         await self.session.commit()
         log_event(logger, "info", "account.created", account_id=account.account_id, login=login)
         return account
 
     async def update(
-        self,
-        account: MT5Account,
-        *,
-        password: str | None = None,
-        broker: str | None = None,
-        label: str | None = None,
-        enabled: bool | None = None,
+        self, account: MT5Account, *, password: str | None = None, enabled: bool | None = None
     ) -> MT5Account:
         if password is not None:
             account.password = password
-            # Fresh credentials are a fresh chance. Without this an account
-            # that struck out would stay skipped by the scheduler even after
-            # the very thing that broke it was fixed.
             account.status = AccountStatus.active
             account.consecutive_failures = 0
             account.last_error = None
-        if broker is not None:
-            account.broker = broker
-        if label is not None:
-            account.label = label
         if enabled is not None:
-            # `enabled` decides whether the scheduler picks the account up;
-            # `status` only ever reports whether the connection works.
             account.enabled = enabled
-
         updated = await self.repo.update(account)
         await self.session.commit()
         log_event(logger, "info", "account.updated", account_id=account.account_id)

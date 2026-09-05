@@ -5,17 +5,15 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 from domain import fx
-from domain.enums import SyncStatus
 
 
 class SyncQueuedResponse(BaseModel):
     account_id: str
-    status: SyncStatus
+    status: str = "queued"
     queue_depth: int
 
 
 class SyncResultResponse(BaseModel):
-
     account_id: str
     ok: bool
     error: Optional[str] = None
@@ -49,16 +47,3 @@ class BalanceSnapshotListResponse(BaseModel):
     account_id: str
     count: int
     snapshots: List[fx.UserBalanceSnapshot]
-
-
-class AccountInfoResponse(BaseModel):
-    account_id: str
-    account_info: fx.FXAccountInfo
-    equity: float
-    # Minutes the trade server's clock currently runs ahead of real UTC. None
-    # means it has not been measured yet, and every *Utc field will be null.
-    # Older timestamps are converted with the offset that was in force then,
-    # which over a daylight saving boundary is not this one.
-    server_utc_offset_minutes: Optional[int]
-    last_synced_at: Optional[str]
-    status: str

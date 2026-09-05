@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -80,10 +80,6 @@ class FXPosition(FXBase):
     isolated: bool = Field(default=False, alias="Isolated")
     closed: bool = Field(default=False, alias="Closed")
     status: Optional[str] = Field(default=None, alias="Status")
-    # MT5 stamps every time in the trade server's clock, and that is what the
-    # unsuffixed fields carry - they are what the terminal itself would show.
-    # The *Utc pair is the same instant with the server's offset taken off, and
-    # is None while that offset is unknown.
     created_at: Optional[datetime] = Field(default=None, alias="CreatedAt")
     closed_at: Optional[datetime] = Field(default=None, alias="ClosedAt")
     created_at_utc: Optional[datetime] = Field(default=None, alias="CreatedAtUtc")
@@ -93,7 +89,6 @@ class FXPosition(FXBase):
 
 
 class FXOpenPosition(FXBase):
-
     id: str = Field(default="", alias="ID")
     pair: str = Field(default="", alias="Pair")
     amount: float = Field(default=0.0, alias="Amount")
@@ -122,3 +117,12 @@ class Transaction(FXBase):
     time_utc: Optional[datetime] = Field(default=None, alias="TimeUtc")
     type: str = Field(default="", alias="Type")
     amount: float = Field(default=0.0, alias="Amount")
+
+
+class SyncPayload(FXBase):
+    account_info: FXAccountInfo = Field(default_factory=FXAccountInfo, alias="AccountInfo")
+    equity: float = Field(default=0.0, alias="Equity")
+    positions: List[FXPosition] = Field(default_factory=list, alias="Positions")
+    open_positions: List[FXOpenPosition] = Field(default_factory=list, alias="OpenPositions")
+    transactions: List[Transaction] = Field(default_factory=list, alias="Transactions")
+    server_clock: List[List[Any]] = Field(default_factory=list, alias="ServerClock")

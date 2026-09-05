@@ -12,19 +12,23 @@
       .\clone.ps1 -Count 6
       .\clone.ps1 -Count 6 -Force            # rebuild existing clones
       .\clone.ps1 -Count 6 -Root E:\MT5
+
+  -Root is optional; without it the pool root comes from .env. See _root.ps1.
 #>
 param(
     [int]$Count = 6,
     [switch]$Force,
-    [string]$Root = "D:\MT5"
+    [string]$Root
 )
 
 $ErrorActionPreference = "Stop"
-$master = Join-Path $Root "master"
 
-if (-not (Test-Path (Join-Path $master "terminal64.exe"))) {
-    throw "master not found at $master"
-}
+. "$PSScriptRoot\_root.ps1"
+$Root = Resolve-MT5Root $Root
+
+$masterExe = Get-MT5MasterExe $Root
+if (-not (Test-Path $masterExe)) { throw "master not found at $masterExe" }
+$master = Split-Path $masterExe -Parent
 if (Get-Process -Name "terminal64" -ErrorAction SilentlyContinue) {
     throw "a terminal64.exe is still running - close every instance before cloning"
 }

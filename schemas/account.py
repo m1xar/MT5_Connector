@@ -13,15 +13,10 @@ class AccountCreateRequest(BaseModel):
     login: int = Field(description="MT5 account number")
     password: str = Field(description="MT5 password (investor or master)")
     server: str = Field(description="Broker server name exactly as the terminal lists it")
-    broker: Optional[str] = None
-    label: Optional[str] = None
-    owner_id: Optional[str] = None
 
 
 class AccountUpdateRequest(BaseModel):
     password: Optional[str] = None
-    broker: Optional[str] = None
-    label: Optional[str] = None
     enabled: Optional[bool] = None
 
 
@@ -29,9 +24,6 @@ class AccountResponse(BaseModel):
     account_id: str
     login: int
     server: str
-    broker: Optional[str]
-    label: Optional[str]
-    owner_id: Optional[str]
     enabled: bool
     status: AccountStatus
     consecutive_failures: int
@@ -55,15 +47,10 @@ def account_to_response(account: MT5Account) -> AccountResponse:
         account_id=account.account_id,
         login=account.login,
         server=account.server,
-        broker=account.broker,
-        label=account.label,
-        owner_id=account.owner_id,
         enabled=account.enabled,
         status=account.status,
         consecutive_failures=account.consecutive_failures,
-        server_utc_offset_minutes=ServerClock.from_rows(
-            account.server_clock
-        ).offset_minutes,
+        server_utc_offset_minutes=ServerClock.from_rows(account.server_clock).offset_minutes,
         balance=account.balance,
         equity=account.equity,
         leverage=account.leverage,

@@ -25,7 +25,7 @@ FastAPI parent (asyncio)          -> Postgres (all normal reads)
  └─ scheduler                     re-queues accounts older than the interval
 
 worker process
-  loop: recv task -> terminal.connect(...) -> executors -> builders -> send models
+  loop: recv task -> terminal.connect(...) -> fetch -> builders -> send models
 ```
 
 The terminal is *not* started when the worker is. It cannot be: `initialize()`
@@ -69,7 +69,7 @@ identifies nothing queryable and is not in any response.
 
 cTrader puts the account balance on every closing deal, so the Go builder does
 `BalanceInit = balanceAfterClose − net`. **MT5 deals carry no balance.**
-`mt5api/helpers/ledger.py` rebuilds it: sum every deal's balance effect, subtract
+`builders/position.py` rebuilds it: sum every deal's balance effect, subtract
 that from the *current* balance to recover the starting balance, then replay
 forward and record the balance after each position's last close.
 
@@ -81,9 +81,26 @@ starting balance. (The Go code does the same — `GetBalanceSnapshots` calls
 ### MAE/MFE and RR
 
 Both hang off one derived quantity: **money per unit of price movement**, which
-the Go builder recovers from the position itself as `|Pnl / priceDelta|`. That
-sidesteps contract sizes and deposit-currency conversion completely — no
+the Go builder recovers from the position itself as `|Pnl / priceDelta|`. `Pnl`
+is the gross result — commission and swap come off only in `NetPnl` — so that
+ratio is exactly what one unit of price was worth to this position. It
+sidesteps contract sizes and deposit-currency conversion completely: no
 `symbol_info` lookup, no FX cross rates.
+
+That is not a stylistic preference. Measured across three brokers, the
+`symbol_info` route is wrong wherever the profit currency is not the deposit
+currency — `trade_contract_size` alone was out by the FX cross (GER30 by 1.159,
+USDCAD by 0.720, USDCHF by 1.238), and by the cross *as it stood then* for an
+old position rather than today's. `trade_tick_value`, which exists to solve
+that, came back `0.0` for both USDCAD and USDCHF and in EUR rather than USD for
+GER30. A delisted symbol has no `symbol_info` at all.
+
+**A position that closed at its entry price cannot answer**: `Pnl` and the price
+delta are both zero, and 0/0 is all it has. The factor is linear in size, so
+`value_per_lot` takes it from another position on the same symbol and scales by
+lots. Failing that the position carries no `MAE`, `MFE` or `RR` — `Amount` is
+lots, not money, and substituting one for the other is wrong by the contract
+size, which on a 0.23 lot EURUSD position is a factor of 100 000.
 
 `MAE`/`MFE` are the worst and best unrealised excursions in deposit currency
 (MAE <= 0, MFE >= 0), taken from the high and low of the candles between
@@ -102,8 +119,8 @@ RRPlanned = |TP − entry| / |entry − SL|
 ```
 
 A trade stopped out for its full risk lands on `RR = -1`. `RRPlanned` is a ratio
-of two price distances, so the money factor cancels. Both stay `None` without a
-stop loss. `NetPnl` is used rather than `Pnl`, so RR reflects what the trader
+of two price distances, so the money factor cancels — it is still answered when
+the factor cannot be recovered at all. Both stay `None` without a stop loss. `NetPnl` is used rather than `Pnl`, so RR reflects what the trader
 actually kept after commission and swap.
 
 Because RR must measure the *original* risk, `_extract_protection` keeps the
@@ -116,10 +133,8 @@ divergence from the Go version, which keeps the last.
 ```
 orchestrator/
   app.py            app factory, lifespan, the selector-loop entrypoint
-  runtime.py        request-scoped dependencies; pool and services on app.state
+  deps.py           bearer auth and request-scoped dependencies
   routes/           accounts.py  sync.py  data.py  pool.py
-  background.py     scheduler loop, task tracking
-  auth.py           bearer token
 
 pool/
   manager.py        the priority queue and the dispatcher
@@ -128,22 +143,23 @@ pool/
   protocol.py       what crosses the pipe
 
 mt5api/
-  terminal.py       the only module that imports MetaTrader5
-  executors.py      account, deals, orders, positions - and waiting for history
-  candles.py        candle windows, and the stray bars from missing history
+  terminal.py       the only module that imports MetaTrader5; start gate, probe
+  fetch.py          every read off a terminal: account, deals, orders, candles, clock cache
   clock.py          the server's UTC offset per switch, read off the trading week
+  enrichment.py     money factors, RR, MAE/MFE
   payload.py        one terminal read -> SyncPayload
-  enrichment.py     MAE/MFE across a set of positions
-  builders/         deals -> FX models (ported from Go); enrich.py has MAE/MFE and RR
-  helpers/          ledger.py (balance reconstruction), timeutil, mathutil
+  builders/         deals -> FX models (ported from Go); position.py carries the ledger
   raw.py            MT5 rows -> plain dataclasses
+  timeutil.py       the epoch floor and the server-clock/UTC tagging rules
+  numbers.py        rounding
+  cache.py          price-cache prune
 
-domain/             fx.py (canonical models), models.py (tables), enums.py
+domain/             fx.py (canonical models and SyncPayload), models.py (tables), enums.py
 repositories/       queries and flush, no commits
-services/           transaction boundaries: account, sync, query
-utils/              config, logging, hashing, ids
+services/           transaction boundaries: account, sync (with the scheduler), query
+utils/              config, logging
 
-deploy/             open-master, clone, prune-history, install-prune-task
+deploy/             open-master, clone, prune-history
 ```
 
 ## Endpoints
@@ -151,14 +167,13 @@ deploy/             open-master, clone, prune-history, install-prune-task
 | Method | Path | |
 |---|---|---|
 | POST/GET/PATCH/DELETE | `/accounts`, `/accounts/{id}` | CRUD |
-| POST | `/accounts?wait=true` | register, then block on the initial sync |
+| POST | `/accounts` | register, then block on the initial sync; 502 if it did not complete |
 | POST | `/accounts/{id}/sync?wait=true` | hard sync, result in the response |
 | POST | `/accounts/{id}/sync?wait=false` | 202, queued at normal priority |
 | GET | `/accounts/{id}/positions?days=N` | closed positions |
 | GET | `/accounts/{id}/open-positions` | live exposure as of the last sync |
 | GET | `/accounts/{id}/balance-snapshots?days=N` | derived on read |
 | GET | `/accounts/{id}/transactions?days=N` | deposits/withdrawals |
-| GET | `/accounts/{id}/info` | balance, leverage, currency |
 | GET | `/pool/status` | per-worker state, queue depth |
 | GET | `/healthz` | public liveness: `ok`, `degraded`, `stalled` |
 
@@ -183,6 +198,10 @@ Why an account is unreachable lives in `last_error`; whether anyone *wants* it
 synced is the separate `enabled` flag. `consecutive_failures` counts failed
 syncs and resets to zero on the first success.
 
+Registration always waits for that sync, and answers **502** with the
+account id and the error if it did not complete — an importer that saw 201 would
+tick the account off as done while every read of it returned nothing.
+
 An account flips to `error_connection` when either:
 
 * **three consecutive syncs fail** (`MT5_API_ACCOUNT_ERROR_THRESHOLD`), or
@@ -190,8 +209,8 @@ An account flips to `error_connection` when either:
   sync ahead of everything else in the pool, with a longer connect timeout
   (`MT5_API_TERMINAL_INITIAL_CONNECT_TIMEOUT_MS`, 120s) than a routine one.
   There is no run of successes for that failure to be a blip in, so one strike
-  is conclusive. `POST /accounts?wait=true` blocks on it and returns the
-  settled status.
+  is conclusive, and the task is never handed to another terminal either.
+  `POST /accounts` blocks on it and returns the settled status.
 
 The scheduler **skips** `error_connection` accounts. It has to: an account that
 has never synced has `last_synced_at IS NULL`, so it is due on every single
@@ -244,7 +263,7 @@ So the offset is measured and reported rather than guessed at — not one
 offset, but the whole history of it, since a broker that keeps daylight saving
 was not on today's offset last January. The result is stored on the account as
 `server_clock`, a step per switch, and the offset in force *now* is shown as
-`server_utc_offset_minutes` in `GET /accounts/{id}` and `/accounts/{id}/info`.
+`server_utc_offset_minutes` in `GET /accounts/{id}`.
 Timestamps come back in pairs — `ClosedAt` is what the terminal itself would
 show, `ClosedAtUtc` is the same instant in real UTC:
 
@@ -260,27 +279,60 @@ on.
 
 ### Measuring it off the week, not the clock
 
-There is no clock to read. `terminal_info` and `account_info` carry no time at
-all; the only timestamp the API exposes outside of history is the last quote's,
-and that is the wrong thing to measure against. Quotes stop at the weekend, and
-a tick left over from Friday does not look broken — for the next fourteen hours
-it reads as a perfectly plausible offset, drifting an hour further out with
-every hour that passes. Since the scheduler syncs every fifteen minutes, every
-weekend would walk straight through that window and store the result.
+There is nothing to ask. `terminal_info` and `account_info` carry no time field
+at all, and asking for bars by date proves nothing: the package reduces the
+argument to an epoch and compares it straight against the stamps, which are
+themselves server labels dressed as UTC. Ask for `12:00` and a bar stamped
+`12:00` comes back — request and response in the same scale, with no real UTC
+anywhere in the loop. That is why `as_mt5_time` tags the argument UTC: to make
+that conversion the identity, not to expose an offset.
 
-`mt5api/clock.py` uses the trading week instead. Forex ends its week at 17:00 in
-New York, a known instant in real UTC for any date — New York's own daylight
-saving is in the zone database. That boundary appears in the bar labels as the
-last bar before the weekend gap, stamped in the server's clock, and the
-difference between the two is the offset.
+Two independent readings answer instead, and they divide the work.
+
+**The live tick owns *now*.** `symbol_info_tick` carries the server's clock and
+this machine carries real UTC, so the difference is the offset — one call,
+nothing downloaded, exact to the hour on all three brokers measured. The catch
+is the weekend: forex quotes stop, and Friday's last tick keeps reading as a
+plausible offset that drifts an hour further out with every hour that passes. So
+it is only trusted inside the trading week, and that window is known in real UTC
+from the zone database without asking the terminal — no circularity. Whether the
+tick has *moved* recently is not a usable test: a thin feed changed its stamp
+once in six seconds while a busy one changed five times, and the thin one was
+right.
+
+The exception is an instrument that trades *through* the weekend. Its tick is
+still fresh when every forex tick has gone stale, so the guard does not apply to
+it — and which instruments those are is measured rather than assumed: the scan
+below already reads a year of bars, and one with no weekend gap at all is, by
+definition, trading through them. Useless for the scan, and on a Saturday the
+only thing that can answer.
+
+**The weekend scan owns history**, which the tick cannot speak to at all. Forex
+ends its week at 17:00 in New York, a known instant in real UTC for any date.
+That boundary appears in the bar labels as the last bar before the weekend gap,
+stamped in the server's clock, and the difference between the two is the offset:
+
+```
+closed_at = label(last bar before the gap) + 1h   an hourly bar is labelled by its open
+reading   = closed_at − (17:00 New York, in real UTC)
+```
 
 Bars are pulled **by position**, so no date is ever sent to the terminal and
-nothing can be shifted on the way in. One call for 60 000 hourly bars covers ten
-years; the same number of *minute* bars would cover two months, which is all the
-minute history most brokers keep anyway. A terminal that already holds the
-history answers in milliseconds. One that does not has to download it, which
-was measured at well under a minute and happens once per terminal process, on
-the first account it syncs.
+nothing can be shifted on the way in. One call for 6 000 hourly bars covers a
+year — about 52 weekends, both switches, and plenty of neighbours for the rules
+below. It used to ask for 60 000. Reading them was free either way, since the
+analysis runs over an array already in memory, but *fetching* them was not: the
+terminal materialises whole years for any window it is asked for, which came to
+~200 MB per symbol per instance and, on a cold terminal with three others
+starting beside it, did not finish inside the task timeout at all — the scan
+walked through four candidate symbols, ~800 MB, and still ended in
+`clock.unknown`. A year costs ~21 MB. The trade is depth: `*Utc` is null older
+than the scan reached, so a year of history converts.
+
+A cold symbol answers the first call with nothing and starts downloading in the
+background, so "not enough bars" means "not yet" rather than "wrong symbol".
+Each candidate is therefore re-read for up to 30s before it is given up on,
+which costs one download instead of five.
 
 Only the Friday edge is read. The Sunday one looks like it should say the same
 thing and does not: for the three weeks each March when New York has moved to
@@ -306,13 +358,31 @@ offset that was in force when it was stamped:
 Two rules separate a switch from a holiday, and both come from the same fact:
 **a reading can only come in low.** The market really does stop at 17:00 in New
 York, so the last bar of the week cannot sit *after* it, while a broker that
-shuts early for a holiday leaves one sitting well before it — three and five
-hours early over Christmas, on the account this was built against. So a change
-is only believed when it is *exactly an hour* and the next weekend *still
-agrees*. Over ten years of hourly history, 496 of 502 weekend readings matched
-the zone the broker turned out to keep, and the two rules together drop all six
-that did not. The result was 20 steps, each landing on the correct European
-switch date.
+shuts early for a holiday leaves one sitting well before it — over the last year
+Thanksgiving and Independence Day moved a gold reading by two and four hours. So
+a change is only believed when it is *exactly an hour* and the next **two**
+weekends still agree.
+
+Two, not one. One is enough for a lone holiday and not for a run of them:
+Christmas and New Year close early in consecutive weeks, and on one account they
+did so by exactly an hour each, which a single confirmation accepted as a switch
+and left every timestamp in that fortnight an hour out. A tail too short to
+confirm counts as unconfirmable rather than confirmed, which matters most of all
+there — the window always ends *now*, so a sync in early January has exactly
+those two weekends sitting in that position.
+
+Demanding two would once have been unaffordable, because the tail is where a
+real switch shows up first and refusing to believe it for a fortnight is its own
+bug. The tick closes that gap: when it disagrees with the scan, a step is
+appended from the start of the current trading week, which is exactly the window
+the scan cannot yet confirm. A switch only ever happens while the market is
+shut, so no timestamp lands between that boundary and the change itself.
+
+Measured over the last year on three brokers: 152 weekend readings, three of
+them moved by a holiday, all three isolated and all three dropped. The steps
+that survived are the correct US switch dates — and on one broker the correct
+*European* ones until 2024, when it changed rule. No calendar would have caught
+that; the measurement did.
 
 Each step is keyed by the first bar after the weekend the switch happened in.
 Both ends of that weekend are known — the change shows up at one Friday close
@@ -321,11 +391,26 @@ and no trade is stamped while the market is shut, so nothing lands in the part
 that is ambiguous.
 
 **`*Utc` is null when the clock cannot be measured**, and for a timestamp older
-than the scan reached, which is a better answer than a wrong one.
+than the scan reached, which is a better answer than a wrong one. When no symbol
+can carry the scan but a tick is available, the tick alone answers for the
+current week rather than leaving everything null.
 
 The stored value is never rewritten: converting is a read-side concern, exactly
 like the `days` window — which is itself translated into the server's clock
-before it is compared against anything, for the same reason.
+before it is compared against anything, for the same reason. `to_utc` always
+tags its result UTC whatever it was handed, so every `*Utc` field carries the
+`Z` and none is quietly naive; a hard sync fills the same pair from the clock
+that read them, so the response and a later read agree.
+
+The clock is measured once per broker per worker process and reused for six
+hours. It changes twice a year, and re-reading it on every sync would mean
+re-downloading the year behind it after each prune. A measurement that *fails*
+is remembered just as long, keyed on the symbols that failed rather than on the
+broker, so an account whose only instrument has no continuous minute history
+pays the candidate walk — five symbols, 30 s each — once per worker process every six hours, not on every sync;
+another account on the same broker with other instruments still gets its own
+attempt. A broker whose clock was ever read keeps that reading through a later
+failed attempt rather than dropping to unknown.
 
 ## What the terminal actually requires
 
@@ -353,20 +438,33 @@ that cannot reach an otherwise-known server looks identical, and the same
 account can give a timeout on one instance and a `-6` on another. Treat a
 timeout as "check the server list first, then the credentials".
 `mt5api/terminal.py` appends that reading to the message, so `last_error`
-carries it. A dead IPC channel stays dead for every later call on
-the module, so that case takes the terminal down with it and the next task
-starts a fresh one; a rejected login leaves it usable.
+carries it.
 
-**A dead terminal takes its worker with it.** The MetaTrader5 package is a
-process-global singleton, and once its IPC channel has gone it does not come
-back inside that process: `shutdown()` then `initialize()` returns True without
-relaunching anything, and every later call fails instantly. Killing all six
-terminals under load left the pool reporting six healthy idle workers while
-every sync failed in a tenth of a second. So a transport-level failure now
-retires the worker process rather than just the module, and the task moves to
-another worker without spending a retry - losing a terminal says nothing about
-the account. Bounded by the pool size, so a pool with no live terminals still
-gives up rather than circling.
+**An IPC timeout does not mean the terminal is dead, so ask it.** A dead
+terminal really does take its worker with it: the MetaTrader5 package is a
+process-global singleton, and once the channel to a killed terminal has gone
+every later call in that process fails instantly — all six terminals killed
+under load left the pool reporting six healthy idle workers while every sync
+failed in a tenth of a second. But the same `-10005` comes back from a *live*
+terminal asked to log in to a server it does not know, and measured on one:
+`terminal_info()` answers immediately afterwards and the next `login()` lands
+in 0.7s. So every IPC failure is followed by one `terminal_info()` probe. No
+answer retires the worker process and moves the task to another worker without
+spending a retry — losing a terminal says nothing about the account. An answer
+leaves the terminal alone and the failure is the account's. Before the probe,
+one misspelt server name walked through all four workers, reset two terminals
+that had just synced perfectly well, and took eleven minutes to say
+`error_connection`.
+
+A failed cold start behaves the same way: `terminal64.exe` stays up with no
+account, and the next `initialize()` on that path attaches to it in under a
+second rather than starting another.
+
+**An initial sync never moves.** One attempt, on one terminal, then the account
+is `error_connection` and the caller gets 502 — even when that terminal turns
+out to be dead. Every clone shares the master's server list, so a server one
+cannot reach none can, and a transport failure on the first sync is far more
+often the account than the terminal.
 
 **Timeouts.** 30s for a routine connect, on a terminal that is already up and
 only switching accounts. 120s for the first sync of a newly added account, which
@@ -377,12 +475,22 @@ restarting produces timeouts that a single instance does not,
 `MT5_API_TERMINAL_INITIAL_CONNECT_TIMEOUT_MS` is the knob, not a broken server
 list.
 
+Cold starts are staggered through a lock shared by the workers, and nobody
+waits on it for more than 20s after the current start began. That is enough
+for the process to come up — a start on this box takes 2–3s — and short enough
+that a start stuck on a server that never answers does not queue every other
+terminal behind its 120s, which is exactly what it did: one bad server name
+held the lock for two minutes while two terminals that then started in 2s each
+waited behind it. The waiters keep that clock, not the holder: `initialize()`
+holds the GIL for its whole wait, so a timer thread meant to hand the lock on
+early only ran after the call returned.
+
 **Dates near the unix epoch.** The package converts datetimes through the
 platform's local-time functions, and Windows probes a day either side to resolve
 DST. Anything within about a day of the epoch pushes that probe below zero,
 where Windows answers `EINVAL` — surfacing as the memorable
 `SystemError: <built-in function history_deals_get> returned a result with an
-exception set`. `helpers/timeutil.py` therefore floors a full history pull at
+exception set`. `mt5api/timeutil.py` therefore floors a full history pull at
 1971-01-01.
 
 **Logins do not fit in an INTEGER.** MT5 account numbers run to ten digits, past
@@ -393,7 +501,7 @@ exception set`. `helpers/timeutil.py` therefore floors a full history pull at
 0 on return and 188 two seconds later. A sync reading through that window
 reconstructs an empty account, and the ledger then derives `BalanceInit` from a
 balance with no deals to explain it, so the damage is quietly wrong numbers
-rather than a failure. `executors.wait_for_history` blocks until the count
+rather than a failure. `fetch.wait_for_history` blocks until the count
 settles, and refuses to believe a zero on an account that holds money.
 
 **A naive datetime handed to MT5 is read in *this machine's* timezone.** Every
@@ -414,7 +522,7 @@ applied the machine's offset a *second* time and MAE/MFE was priced from bars
 three hours before the position ever traded, on every position measured during
 a sync.
 
-`helpers/timeutil.as_mt5_time` tags the argument UTC, which makes the package's
+`timeutil.as_mt5_time` tags the argument UTC, which makes the package's
 conversion the identity. The window then comes back exactly as asked for — no
 widening, no offset needed, and the same answer on any machine.
 
@@ -518,10 +626,19 @@ Open it with `deploy\open-master.cmd`, which passes `/portable`. Opening it any
 other way sends it to `%APPDATA%\MetaQuotes`, and the brokers added there will
 never reach the clones.
 
-Add **every broker server you intend to use**, through *File → Open an Account*.
-`mt5.login` cannot reach a server the terminal has never heard of, and
-`Config\servers.dat` is only written when the terminal exits — so close it fully
-before cloning.
+Brokers do **not** have to be added to the master. The terminal looks a server
+up by name through MetaQuotes' directory on the first login: measured on a
+99-account list spanning 51 servers, none of which the master had seen, 50
+resolved on the first try and the one that did not (`HFMarketsGlobal-Live3`)
+timed out the same way a misspelt name does. *File → Open an Account* in the
+master is only worth doing for a server the directory does not list — and then
+close the terminal fully before cloning, since `Config\servers.dat` is written
+on exit.
+
+Keep the master on the current build. Every clone otherwise downloads the
+update itself on first start (370 MB into `%APPDATA%\MetaQuotes`, portable or
+not) and applies it on the next; opening the master, letting it download, and
+opening it once more takes two minutes and every clone then starts current.
 
 The master also carries the settings every clone inherits, which are worth
 checking after any manual session with it:
@@ -543,6 +660,11 @@ Run it with every terminal closed. It copies the master N times, strips the
 per-instance caches, and prints the `MT5_API_TERMINAL_PATHS` line to paste into
 `.env`. `-Force` rebuilds clones that already exist.
 
+`-Root` is optional on every script in `deploy\`. Left out, it is read back from
+`MT5_API_TERMINAL_PATHS` in `.env` — the clones are listed there and the master
+sits beside them — falling back to `D:\MT5`. That is what makes
+`open-master.cmd` work on a double-click, which passes no arguments at all.
+
 ### 4. The service
 
 ```powershell
@@ -559,6 +681,7 @@ The settings that decide whether it works at all:
 | `MT5_API_TERMINAL_PORTABLE` | must match how the instances were installed; a mismatch sends the terminals to a data directory with no accounts in it |
 | `MT5_API_DATABASE_URL` | |
 | `MT5_API_API_TOKEN` | leaving it empty disables auth on every route but `/healthz` |
+| `MT5_API_PRUNE_CACHE_AFTER_SYNC` | on by default; without it the price cache grows without bound |
 
 Startup logs an `app.startup.config` warning for each terminal path that is not
 there, an empty pool, and a missing token. Then check `GET /healthz` and
@@ -566,40 +689,58 @@ there, an empty pool, and a missing token. Then check `GET /healthz` and
 
 ### 5. Housekeeping
 
-The price cache has to be pruned on a schedule. Without it it grows without
-limit — see *A minute window in the past is never cheap* above. One command
-registers it:
+The price cache prunes itself. Each worker drops its own instance's price
+history after every sync it finishes — `MT5_API_PRUNE_CACHE_AFTER_SYNC`, on by
+default. Nothing is kept: what a later sync genuinely needs it fetches again,
+and that is little, because MAE/MFE is measured once per position and the clock
+is held in memory between syncs. Measured across four instances, this held the
+pool at ~250 MB where it had reached 4.3 GB unattended.
 
-```powershell
-# elevated PowerShell, from the repository
-.\deploy\install-prune-task.ps1 -IntervalMinutes 30 -Root D:\MT5
-```
+It runs after the result is on its way, so a hard sync never waits for it, and
+a failure is logged rather than failing the task. Files the terminal holds open
+are skipped by Windows and go on the next run.
 
-That registers a SYSTEM task repeating every 30 minutes, starting at boot, and
-kicks off a first run so you can see it work. Verify with
-`Get-ScheduledTask -TaskName 'MT5 prune history cache' | Get-ScheduledTaskInfo`,
-undo with `-Remove`.
-
-Run `deploy\prune-history.ps1` by hand without `-Apply` to see what it would
-reclaim. It is safe against a live pool: files a terminal holds open are
-skipped, and anything still needed is re-downloaded on demand.
+`deploy\prune-history.ps1` is what is left for the cases the service cannot
+reach: an instance the pool is not currently syncing through, a one-off reclaim
+with the pool stopped, or a dry run — without `-Apply` — to see the size
+first.
 
 ### What it costs
 
-Measured with six terminals on one box:
+Measured in a load test on one box (12 cores, 15 GB, four terminals, 99 real
+accounts of which 66 had valid credentials):
 
 | | |
 |---|---|
-| idle terminal | ~130 MB RSS |
-| terminal mid-backfill | ~500 MB RSS |
-| six terminals + API + six worker processes | ~1.6 GB peak observed |
-| worst case, all six backfilling at once | ~3.6 GB |
-| disk, per instance | 250 MB, plus the price cache the prune keeps in check |
+| terminal after a sync, cache pruned | ~250 MB RSS; 1.3 GB peak for four |
+| API + four worker processes | ~600 MB |
+| CPU | peaks of 87% on cold starts and first-time MAE/MFE; steady background syncing barely registers |
+| initial sync, warm terminal | p50 10 s, p90 28 s; up to 160 s for an account with thousands of positions |
+| hard sync after the first, in the worker | p50 6 s |
+| background cycle, 64 accounts | 4 min 19 s — 4.0 s per account across the pool |
+| disk, per instance | 270 MB, plus the price cache the prune keeps in check |
 
-A cold terminal start is about twelve seconds and they are serialised across the
-pool, so a six-worker pool takes roughly a minute to have every terminal up —
-but only as tasks arrive, since a terminal cannot start before a task supplies
+At 4 s per account, a four-terminal pool re-syncs about **220 accounts inside a
+15-minute interval** and about 890 inside an hour, once their history has been
+priced. Two things eat into that: a new account costs 10–70 s of a worker on top,
+and an account whose server never answers costs one 120 s. Neither disturbed
+the rest of the pool in the test — no worker restarts, no terminals reset.
+
+A cold terminal start is two to three seconds once the process is up, and
+starts are staggered across the pool, so a pool has every terminal up within a
+minute of tasks arriving — a terminal cannot start before a task supplies
 credentials.
+
+**Database connections.** A request holds a pooled connection only while it
+reads or writes; a hard sync and an account registration give theirs back
+before they wait on the pool. `MT5_API_DB_POOL_SIZE` (30) and
+`MT5_API_DB_MAX_OVERFLOW` (50) size the pool — 80 in total, enough for fifty
+hard syncs arriving at once with room to spare. Postgres itself defaults to
+100 connections; the dev compose file raises it to 200, and a production
+database must allow at least the pool's 80 plus everything else that connects. Before the wait was taken out of the session, sixteen
+callers waiting on hard syncs used up a 15-connection pool and the worker that
+had to write the result got none: the sync ran, the caller got 200 with the
+data, and the database never saw it.
 
 ## Verifying
 
@@ -616,9 +757,12 @@ is the reconstruction itself, which needs an account with real trading history:
    busy, the queue draining, and a hard sync fired mid-way coming back first.
 4. Kill one `terminal64.exe` mid-sync — the service should restart that worker
    and finish the task.
-5. Check the clock: `GET /accounts/{id}/info` should report a
+5. Check the clock: `GET /accounts/{id}` should report a
    `server_utc_offset_minutes` that matches the terminal's own Market Watch
-   time. It reads off history rather than a live quote, so the weekend is as
-   good a time as any. Then check positions from either side of a daylight
-   saving switch — on a broker keeping European time, `ClosedAt` minus
-   `ClosedAtUtc` should be three hours in July and two in January.
+   time. Inside the trading week that comes off a live quote; at the weekend it
+   falls back to the weekend scan, so either is a fair time to look. Then check
+   positions from either side of a daylight saving switch — `ClosedAt` minus
+   `ClosedAtUtc` should be three hours in summer and two in winter on a broker
+   keeping European time. Every `*Utc` field carries a `Z` and no unsuffixed
+   one does; a hard sync response and a later `GET` of the same position must
+   agree on both.

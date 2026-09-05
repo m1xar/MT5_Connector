@@ -1,21 +1,35 @@
 from __future__ import annotations
 
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import async_session_factory
 from domain.models import MT5Account
 from pool.manager import PoolManager
 from repositories.account_repo import AccountRepository
-from schemas.common import ErrorResponse
 from services.sync_service import SyncService
+from utils.config import settings
 
-# Every authenticated route can answer these, so they are declared once and
-# spread into each route's own `responses`.
+
+class ErrorResponse(BaseModel):
+    detail: str
+
+
 COMMON_RESPONSES = {
     401: {"model": ErrorResponse, "description": "Invalid or missing bearer token"},
     404: {"model": ErrorResponse, "description": "Account not found"},
 }
+
+_bearer = HTTPBearer(auto_error=False)
+
+
+async def verify_auth(credentials: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> None:
+    if not settings.api_token:
+        return
+    if credentials is None or credentials.credentials != settings.api_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing bearer token")
 
 
 def get_pool(request: Request) -> PoolManager:

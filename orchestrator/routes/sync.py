@@ -6,16 +6,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from domain.enums import SyncKind, SyncStatus
+from domain.enums import SyncKind
 from pool.manager import PoolManager
 from schemas.sync import SyncQueuedResponse, SyncResultResponse
 from services.sync_service import SyncService
 from utils.config import settings
 
-from ..auth import verify_auth
-from ..runtime import COMMON_RESPONSES, get_pool, get_session, get_sync_service, load_account
+from ..deps import COMMON_RESPONSES, get_pool, get_session, get_sync_service, load_account, verify_auth
 
-router = APIRouter(tags=["Sync"], responses=COMMON_RESPONSES)
+router = APIRouter(tags=["Sync"], responses=COMMON_RESPONSES, dependencies=[Depends(verify_auth)])
 
 
 @router.post(
@@ -27,10 +26,7 @@ router = APIRouter(tags=["Sync"], responses=COMMON_RESPONSES)
         "already written to the database. With `wait=false` the sync is queued at "
         "normal priority and 202 comes back immediately."
     ),
-    responses={
-        **COMMON_RESPONSES,
-        504: {"description": "Hard sync exceeded its wait timeout"},
-    },
+    responses={**COMMON_RESPONSES, 504: {"description": "Hard sync exceeded its wait timeout"}},
 )
 async def sync_account(
     account_id: str,
@@ -38,34 +34,26 @@ async def sync_account(
     session: AsyncSession = Depends(get_session),
     service: SyncService = Depends(get_sync_service),
     terminal_pool: PoolManager = Depends(get_pool),
-    _auth: str | None = Depends(verify_auth),
 ):
     account = await load_account(session, account_id)
     kind = SyncKind.hard if wait else SyncKind.scheduled
     _run_id, future = await service.request(session, account, kind)
+    await session.close()
 
     if not wait:
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content=SyncQueuedResponse(
-                account_id=account_id,
-                status=SyncStatus.queued,
-                queue_depth=terminal_pool.status().queue_depth,
+                account_id=account_id, queue_depth=terminal_pool.status().queue_depth
             ).model_dump(mode="json"),
         )
 
     try:
-        result = await asyncio.wait_for(
-            asyncio.shield(future),
-            timeout=settings.hard_sync_wait_timeout_seconds,
-        )
+        result = await asyncio.wait_for(asyncio.shield(future), timeout=settings.hard_sync_wait_timeout_seconds)
     except asyncio.TimeoutError:
         raise HTTPException(
             status_code=504,
-            detail=(
-                f"Hard sync still running after "
-                f"{settings.hard_sync_wait_timeout_seconds}s; poll the account instead"
-            ),
+            detail=f"Hard sync still running after {settings.hard_sync_wait_timeout_seconds}s; poll the account instead",
         )
 
     payload = result.payload

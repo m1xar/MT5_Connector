@@ -44,9 +44,7 @@ def pool_status_to_response(status: PoolStatus) -> PoolStatusResponse:
                 pid=worker.pid,
                 current_account_id=worker.current_account_id,
                 current_task_started_at=(
-                    worker.current_task_started_at.isoformat()
-                    if worker.current_task_started_at
-                    else None
+                    worker.current_task_started_at.isoformat() if worker.current_task_started_at else None
                 ),
                 tasks_completed=worker.tasks_completed,
                 tasks_failed=worker.tasks_failed,
