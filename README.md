@@ -792,9 +792,19 @@ systemctl stop mt5api
 bash deploy/linux/make-master.sh t1
 ```
 
-Measured: a clone of a current master logged in and synchronised in two
-seconds with no LiveUpdate activity at all. `clone-pool.sh` refuses to clone a
-master that still carries credentials.
+Measured: a pool cloned from a current master starts on build 6182 and pulls
+no update on login. `clone-pool.sh` refuses to clone a master that still
+carries credentials.
+
+That removes the download, but not the whole problem. On the final check of a
+freshly cloned pool, the first sync through every never-used terminal still
+failed "no deal history arrived" — with the settle window at 30 s and again at
+90 s — while the second pass through the same terminals came back clean. A
+terminal's first session with a broker does not hand deal history to the API;
+its next one does. On a bare box there are no accounts to spend on that first
+session, so for now the operational answer is the two-round check below, and
+the real fix belongs in the service: an initial sync should not be judged on
+a terminal's first-ever session.
 
 Four things about this are not obvious, and each of them fails silently:
 
@@ -823,9 +833,10 @@ configured, so the first unusual burst takes the service down rather than
 slowing it.
 
 `verify-pool.py` runs two rounds of hard syncs over every active account and
-exits non-zero if the last one still fails, so it can gate a deploy. On a pool
-cloned from a current master both rounds come back clean. A first round that
-fails and a second that passes is the signature of a stale master.
+exits non-zero if the last one still fails, so it can gate a deploy. Expect the
+first round on a fresh pool to fail on the terminals it touches for the first
+time and the second to pass; a second round that still fails is the real
+signal.
 
 ## Verifying
 

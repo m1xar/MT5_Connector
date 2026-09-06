@@ -13,8 +13,9 @@
 # A terminal that has already run has both halves solved: it downloaded the
 # update and applied it on its next start, and it has accumulated the broker
 # list. Promoting it to master means clones are born current and download
-# nothing. Measured: a clone of a current master logged in and synchronised
-# in two seconds with zero LiveUpdate activity.
+# nothing on login. It does not make a terminal's first-ever session with a
+# broker deliver deal history - measured, that still needs a second pass
+# (see verify-pool.py) - but it removes the 190 MB download from that pass.
 #
 # What has to come out of it first is the point of this script. A working
 # terminal stores the credentials of every account it has ever logged into
