@@ -1,0 +1,10 @@
+# Shell scripts and the compose file are executed on Linux. Checked out with
+# CRLF they fail with "bad interpreter: /usr/bin/env bash^M", so pin them to
+# LF regardless of the checkout platform.
+*.sh text eol=lf
+*.py text eol=lf
+deploy/linux/docker-compose.yml text eol=lf
+
+# PowerShell scripts run on Windows.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf

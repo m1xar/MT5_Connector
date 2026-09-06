@@ -595,9 +595,12 @@ server on a `SelectorEventLoop` instead.
 
 ## Deploying
 
-Needs **Windows** — `MetaTrader5` is Windows-only, and so is everything the
-terminal does. The repository only carries the service; the four things below
-live outside it and have to exist on the box before the service is any use.
+Needs a **Windows environment** — `MetaTrader5` is a Windows-only wheel, and so
+is everything the terminal does. That environment can be Windows itself, or
+Wine on Linux; the code is identical either way, and the Linux route is written
+up in *Deploying on Linux* below. The repository only carries the service; the
+four things below live outside it and have to exist on the box before the
+service is any use.
 
 ### 1. Machine
 
@@ -741,6 +744,88 @@ database must allow at least the pool's 80 plus everything else that connects. B
 callers waiting on hard syncs used up a 15-connection pool and the worker that
 had to write the result got none: the sync ran, the caller got 200 with the
 data, and the database never saw it.
+
+## Deploying on Linux
+
+The service runs on Linux unchanged. `MetaTrader5` is imported in exactly one
+place — `mt5api/terminal.py` — so rather than splitting the service in two and
+bridging it over RPC, the whole process runs inside a single Wine prefix:
+the API, the scheduler and every worker. Process spawning and the worker pipes
+behave under Wine as they do on Windows, so the pool needs no changes at all.
+
+Postgres stays a native Linux service, or a container. It has no business
+inside the emulation, and keeping it out means it does not compete for the one
+resource that actually runs short.
+
+Measured on Ubuntu 24.04, 6 cores, 11 GB, against 100 real accounts: 63 active,
+zero failures across sync storms of 20 and 50 concurrent, a background cycle of
+6.3 s per account. The same work costs roughly twice the CPU it does on
+Windows — 72% of the time was spent in the kernel, one terminal peaking at
+three cores — because every Windows system call is being translated. Compare
+the price per hundred accounts served, not the price of the box.
+
+```bash
+sudo bash deploy/linux/install.sh          # Wine, Xvfb, Windows Python, deps
+docker compose -f deploy/linux/docker-compose.yml up -d    # or the distro's postgres
+# put a current portable master at /opt/mt5/wine/drive_c/MT5/master
+bash deploy/linux/clone-pool.sh 12
+# write /opt/mt5/wine/drive_c/app/.env  (paths look like C:\MT5\t1\terminal64.exe)
+sudo bash deploy/linux/service.sh install
+python3 deploy/linux/verify-pool.py --token "$TOKEN" --parallel 12
+```
+
+The master is the deployment artefact, and it has to be on the current build.
+A terminal from an older package downloads its update on the first login —
+about 190 MB — and that download starves the deal-history fetch, so that first
+sync fails with "no deal history arrived" while reporting the balance
+perfectly correctly. Every clone repeats it, and on a bare box there are no
+accounts yet to warm the pool with, so this cannot be fixed after the fact.
+
+A terminal that has been in service has already solved both halves: it applied
+the update on its next start, and it accumulated the broker list.
+`make-master.sh` promotes one to master and strips what must not travel with
+it — above all `Config/accounts.dat`, which holds the credentials of every
+account that terminal ever logged into:
+
+```bash
+systemctl stop mt5api
+bash deploy/linux/make-master.sh t1
+```
+
+Measured: a clone of a current master logged in and synchronised in two
+seconds with no LiveUpdate activity at all. `clone-pool.sh` refuses to clone a
+master that still carries credentials.
+
+Four things about this are not obvious, and each of them fails silently:
+
+| | |
+|---|---|
+| `WINEDLLOVERRIDES="mscoree,mshtml="` | without it `wineboot` blocks forever on the Mono/Gecko dialog, which nothing can answer on a headless box. This is the usual reason a Wine setup looks hung |
+| a virtual display | the terminals will not start without one, so `xvfb.service` exists and `mt5api.service` requires it |
+| the interpreter is a *Windows* Python inside the prefix | a Linux `python3` cannot load the `MetaTrader5` wheel however much Wine is installed |
+| the launch command lives in `/opt/mt5/bin/mt5api-run.sh` | systemd strips backslashes out of `ExecStart`, mangling every Windows path handed to it |
+
+Pool size was measured rather than guessed, with one storm over the same 63
+accounts:
+
+| pool | storm | median sync | memory | free |
+|---|---|---|---|---|
+| 6 | 218 s | 46.2 s | 3.9 GB | 8.1 GB |
+| 12 | 157 s | 33.2 s | 5.7 GB | 6.3 GB |
+| 18 | 168 s | 31.9 s | 7.4 GB | 4.6 GB |
+| 24 | 167 s | 32.6 s | 9.3 GB | 0.9 GB |
+
+Everything is won going from 6 to 12; 18 and 24 are flat. Extra terminals pay
+only while they fill the gaps where one waits on a broker, and once those are
+full the work is back to sharing six cores. Roughly two terminals per core is
+the ceiling. Twenty-four also leaves under a gigabyte free with no swap
+configured, so the first unusual burst takes the service down rather than
+slowing it.
+
+`verify-pool.py` runs two rounds of hard syncs over every active account and
+exits non-zero if the last one still fails, so it can gate a deploy. On a pool
+cloned from a current master both rounds come back clean. A first round that
+fails and a second that passes is the signature of a stale master.
 
 ## Verifying
 

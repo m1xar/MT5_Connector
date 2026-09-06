@@ -1,0 +1,40 @@
+# The database for a Linux box, in Docker.
+#
+#   docker compose -f deploy/linux/docker-compose.yml up -d
+#
+# Only the database is containerised. The service itself cannot be: it needs
+# the MetaTrader terminals, which are Windows processes running under a Wine
+# prefix on the host. Postgres has no such constraint, so run it whichever way
+# you already run databases - this file, or the distribution package. Nothing
+# in the service can tell the difference.
+#
+# Set POSTGRES_PASSWORD before bringing it up, and match it in the service's
+# MT5_API_DATABASE_URL.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: mt5_api_pg
+    restart: unless-stopped
+    # The API may open up to 80 connections (MT5_API_DB_POOL_SIZE +
+    # MT5_API_DB_MAX_OVERFLOW). The default 100 leaves too little headroom
+    # for psql and for a second service on the same database.
+    command: postgres -c max_connections=200
+    environment:
+      POSTGRES_USER: mt5_api
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: mt5_api
+    ports:
+      # Bound to loopback: the service runs on this same host, and the
+      # database has no reason to be reachable from outside it.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - mt5_api_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mt5_api -d mt5_api"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mt5_api_pgdata:
