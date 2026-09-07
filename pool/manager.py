@@ -4,7 +4,7 @@ import asyncio
 import logging
 import multiprocessing
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import count
 from typing import Awaitable, Callable
 
@@ -12,7 +12,7 @@ from domain.enums import SyncKind
 from mt5api.terminal import AUTHORIZATION_FAILED, StartGate
 from utils.logging import log_event
 
-from .protocol import PRIORITY_HARD, PRIORITY_SCHEDULED, PoolStatus, SyncResult, SyncTask, WorkerState
+from .protocol import PRIORITY_HARD, PRIORITY_SCHEDULED, SyncResult, SyncTask, WorkerState
 from .worker import worker_main
 from .worker_handle import WorkerHandle
 
@@ -22,15 +22,24 @@ ResultHandler = Callable[[SyncResult], Awaitable[None]]
 
 _SHUTDOWN_DRAIN_SECONDS = 30.0
 _REAP_INTERVAL_SECONDS = 60.0
+_SPAWN_BATCH = 4
 
 
 @dataclass
 class _QueuedTask:
     task: SyncTask
     priority: int
-    future: "asyncio.Future[SyncResult]"
+    future: asyncio.Future[SyncResult]
+    max_retries: int | None
     attempts: int = 0
-    max_retries: int | None = None
+
+
+@dataclass(slots=True)
+class PoolStatus:
+    workers: list[WorkerHandle] = field(default_factory=list)
+    queue_depth: int = 0
+    hard_sync_queue_depth: int = 0
+    idle_workers: int = 0
 
 
 class PoolManager:
@@ -38,21 +47,20 @@ class PoolManager:
         self,
         terminal_paths: list[str],
         *,
-        on_result: ResultHandler | None = None,
-        task_timeout_seconds: float = 300.0,
-        worker_start_timeout_seconds: float = 120.0,
-        max_task_retries: int = 2,
-        init_timeout_ms: int = 30000,
-        login_timeout_ms: int = 30000,
-        terminal_portable: bool = False,
-        history_settle_timeout_seconds: float = 30.0,
-        prune_cache_after_sync: bool = False,
-        log_level: str = "INFO",
-        log_json: bool = True,
-        enrich_mae_mfe: bool = True,
+        task_timeout_seconds: float,
+        worker_start_timeout_seconds: float,
+        max_task_retries: int,
+        init_timeout_ms: int,
+        login_timeout_ms: int,
+        terminal_portable: bool,
+        history_settle_timeout_seconds: float,
+        prune_cache_after_sync: bool,
+        log_level: str,
+        log_json: bool,
+        enrich_mae_mfe: bool,
     ) -> None:
         self.terminal_paths = terminal_paths
-        self.on_result = on_result
+        self.on_result: ResultHandler | None = None
         self.task_timeout_seconds = task_timeout_seconds
         self.max_task_retries = max_task_retries
 
@@ -75,7 +83,7 @@ class PoolManager:
         self._dispatchers: list[asyncio.Task] = []
         self._reaper: asyncio.Task | None = None
         self._running: set[asyncio.Task] = set()
-        self._pending: dict[str, tuple[str | None, "asyncio.Future[SyncResult]"]] = {}
+        self._pending: dict[str, asyncio.Future[SyncResult]] = {}
         self._closing = False
 
     async def start(self) -> None:
@@ -91,10 +99,7 @@ class PoolManager:
             for index, path in enumerate(self.terminal_paths)
         }
         workers = list(self._workers.values())
-        results = await asyncio.gather(*(worker.spawn() for worker in workers), return_exceptions=True)
-        for worker, ok in zip(workers, results):
-            if ok is True:
-                worker.mark_idle()
+        await self._spawn_in_batches(workers, WorkerHandle.spawn)
 
         self._dispatchers = [
             asyncio.create_task(self._dispatch_loop(worker), name=f"pool-dispatcher-{worker.worker_id}")
@@ -103,7 +108,7 @@ class PoolManager:
         self._reaper = asyncio.create_task(self._reap_loop(), name="pool-reaper")
         log_event(
             logger, "info", "pool.started",
-            workers=len(workers), ready=sum(1 for w in workers if w.state == WorkerState.idle),
+            workers=len(workers), ready=sum(1 for worker in workers if worker.state is WorkerState.idle),
         )
 
     async def stop(self) -> None:
@@ -118,8 +123,8 @@ class PoolManager:
                 pass
         self._dispatchers, self._reaper = [], None
 
+        await asyncio.gather(*(worker.terminate() for worker in self._workers.values()))
         for worker in self._workers.values():
-            await worker.terminate()
             worker.state = WorkerState.stopped
 
         if self._running:
@@ -147,15 +152,13 @@ class PoolManager:
         server: str,
         *,
         terminal_path: str,
-        priority: int = PRIORITY_SCHEDULED,
-        kind: SyncKind = SyncKind.scheduled,
-        sync_run_id: str | None = None,
+        kind: SyncKind,
+        sync_run_id: str,
         connect_timeout_ms: int | None = None,
         already_measured: frozenset[str] = frozenset(),
-        max_retries: int | None = None,
-    ) -> "asyncio.Future[SyncResult]":
+    ) -> asyncio.Future[SyncResult]:
         worker = self._workers[terminal_path]
-        future: "asyncio.Future[SyncResult]" = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[SyncResult] = asyncio.get_running_loop().create_future()
         item = _QueuedTask(
             task=SyncTask(
                 task_id=str(uuid.uuid4()),
@@ -168,25 +171,45 @@ class PoolManager:
                 connect_timeout_ms=connect_timeout_ms,
                 already_measured=already_measured,
             ),
-            priority=priority,
+            priority=PRIORITY_SCHEDULED if kind is SyncKind.scheduled else PRIORITY_HARD,
             future=future,
-            max_retries=max_retries,
+            max_retries=0 if kind is SyncKind.initial else None,
         )
-        self._pending[account_id] = (sync_run_id, future)
+        if self._closing:
+            future.set_result(self._failure(worker, item, "pool is shutting down"))
+            return future
+        self._pending.setdefault(account_id, future)
         self._enqueue(worker, item)
         log_event(
             logger, "info", "pool.task.queued",
             account_id=account_id, task_id=item.task.task_id, worker_id=worker.worker_id,
-            priority=priority, queue_depth=worker.queue.qsize(),
+            priority=item.priority, queue_depth=worker.queue_depth,
         )
         return future
 
-    def pending_for(self, account_id: str) -> "tuple[str | None, asyncio.Future[SyncResult]] | None":
+    def pending_for(self, account_id: str) -> asyncio.Future[SyncResult] | None:
         return self._pending.get(account_id)
 
+    def queue_depth_for(self, terminal_path: str) -> int:
+        return self._workers[terminal_path].queue_depth
+
     def _enqueue(self, worker: WorkerHandle, item: _QueuedTask) -> None:
-        worker.hard_queued += item.priority == PRIORITY_HARD
+        if item.priority == PRIORITY_HARD:
+            worker.hard_queued += 1
         worker.queue.put_nowait((item.priority, next(self._sequence), item))
+
+    async def _spawn_in_batches(
+        self, workers: list[WorkerHandle], spawn: Callable[[WorkerHandle], Awaitable[bool]]
+    ) -> None:
+        for start in range(0, len(workers), _SPAWN_BATCH):
+            batch = workers[start:start + _SPAWN_BATCH]
+            results = await asyncio.gather(*(spawn(worker) for worker in batch), return_exceptions=True)
+            for worker, outcome in zip(batch, results):
+                if isinstance(outcome, BaseException):
+                    worker.last_error = f"{type(outcome).__name__}: {outcome}"
+                    worker.mark_failed()
+            if self._closing:
+                return
 
     async def _dispatch_loop(self, worker: WorkerHandle) -> None:
         while not self._closing:
@@ -194,8 +217,9 @@ class PoolManager:
             try:
                 await worker.ready.wait()
                 _, _, item = await worker.queue.get()
-                worker.hard_queued -= item.priority == PRIORITY_HARD
                 await worker.ready.wait()
+                if item.priority == PRIORITY_HARD:
+                    worker.hard_queued -= 1
                 running = asyncio.create_task(self._execute(worker, item), name=f"pool-task-{item.task.task_id}")
                 item = None
                 self._running.add(running)
@@ -206,6 +230,8 @@ class PoolManager:
                     self._resolve(item, self._failure(worker, item, "pool is shutting down"))
                 raise
             except Exception as exc:
+                if item is not None:
+                    self._resolve(item, self._failure(worker, item, f"pool error: {type(exc).__name__}: {exc}"))
                 log_event(
                     logger, "error", "pool.dispatch.failed",
                     worker_id=worker.worker_id, error=f"{type(exc).__name__}: {exc}",
@@ -216,14 +242,14 @@ class PoolManager:
         while not self._closing:
             try:
                 await asyncio.sleep(_REAP_INTERVAL_SECONDS)
-                for worker in self._workers.values():
-                    if self._closing:
-                        return
-                    if worker.state is not WorkerState.failed:
-                        continue
+                failed = [worker for worker in self._workers.values() if worker.state is WorkerState.failed]
+                if not failed:
+                    continue
+                for worker in failed:
                     log_event(logger, "info", "pool.worker.reaping", worker_id=worker.worker_id, error=worker.last_error)
-                    if await worker.restart():
-                        worker.mark_idle()
+                await self._spawn_in_batches(failed, WorkerHandle.restart)
+                for worker in failed:
+                    if worker.state is WorkerState.idle:
                         log_event(logger, "info", "pool.worker.recovered", worker_id=worker.worker_id)
             except asyncio.CancelledError:
                 raise
@@ -232,7 +258,7 @@ class PoolManager:
 
     async def _execute(self, worker: WorkerHandle, item: _QueuedTask) -> None:
         try:
-            await self._execute_guarded(worker, item)
+            await self._run_item(worker, item)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -243,7 +269,7 @@ class PoolManager:
             worker.mark_failed()
             await self._complete(item, self._failure(worker, item, f"pool error: {type(exc).__name__}: {exc}"))
 
-    async def _execute_guarded(self, worker: WorkerHandle, item: _QueuedTask) -> None:
+    async def _run_item(self, worker: WorkerHandle, item: _QueuedTask) -> None:
         task = item.task
         item.attempts += 1
         worker.claim(task)
@@ -257,9 +283,11 @@ class PoolManager:
             worker_healthy = False
 
         worker.release(result)
+        if self._closing:
+            self._resolve(item, self._failure(worker, item, "pool is shutting down"))
+            return
 
-        if not worker_healthy and not self._closing:
-            worker.state = WorkerState.restarting
+        if not worker_healthy:
             worker_healthy = await worker.restart()
         if worker_healthy:
             worker.mark_idle()
@@ -283,8 +311,11 @@ class PoolManager:
             )
             return self._failure(worker, item, f"timed out after {self.task_timeout_seconds}s"), False
         except (EOFError, OSError, ConnectionError) as exc:
-            worker.last_error = str(exc)
-            log_event(logger, "error", "pool.worker.lost", worker_id=worker.worker_id, account_id=item.task.account_id, error=str(exc))
+            worker.last_error = f"{type(exc).__name__}: {exc}"
+            log_event(
+                logger, "error", "pool.worker.lost",
+                worker_id=worker.worker_id, account_id=item.task.account_id, error=worker.last_error,
+            )
             return self._failure(worker, item, f"worker lost: {exc}"), False
 
     def _should_retry(self, item: _QueuedTask, result: SyncResult) -> bool:
@@ -304,12 +335,14 @@ class PoolManager:
             try:
                 await self.on_result(result)
             except Exception as exc:
-                log_event(logger, "error", "pool.result.handler_failed", account_id=result.account_id, error=str(exc))
+                log_event(
+                    logger, "error", "pool.result.handler_failed",
+                    account_id=result.account_id, error=f"{type(exc).__name__}: {exc}",
+                )
         self._resolve(item, result)
 
     def _resolve(self, item: _QueuedTask, result: SyncResult) -> None:
-        pending = self._pending.get(item.task.account_id)
-        if pending is not None and pending[1] is item.future:
+        if self._pending.get(item.task.account_id) is item.future:
             self._pending.pop(item.task.account_id, None)
         if not item.future.done():
             item.future.set_result(result)
@@ -336,8 +369,8 @@ class PoolManager:
     def status(self) -> PoolStatus:
         workers = list(self._workers.values())
         return PoolStatus(
-            workers=[worker.status() for worker in workers],
-            queue_depth=sum(worker.queue.qsize() for worker in workers),
+            workers=workers,
+            queue_depth=sum(worker.queue_depth for worker in workers),
             hard_sync_queue_depth=sum(worker.hard_queued for worker in workers),
-            idle_workers=sum(1 for worker in workers if worker.state == WorkerState.idle),
+            idle_workers=sum(1 for worker in workers if worker.state is WorkerState.idle),
         )

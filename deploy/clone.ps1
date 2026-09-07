@@ -34,7 +34,7 @@ if (Get-Process -Name "terminal64" -ErrorAction SilentlyContinue) {
 }
 
 # Per-instance state: caches and logs that must not be carried into a clone.
-$transient = @("logs", "Bases", "Tester", "llm-agent", "MQL5\logs", "MQL5\Files\Temp")
+$transient = @("logs", "Bases", "Tester", "llm-agent", "MQL5\Logs", "MQL5\Files\Temp")
 
 $paths = @()
 for ($i = 1; $i -le $Count; $i++) {

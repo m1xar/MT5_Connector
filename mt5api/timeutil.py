@@ -11,9 +11,12 @@ def cutoff_from_days(days: int | None) -> datetime | None:
     return datetime.now(timezone.utc) - timedelta(days=days)
 
 
-def history_range(days: int | None = None) -> tuple[datetime, datetime]:
-    end = datetime.now(timezone.utc) + timedelta(days=1)
-    return cutoff_from_days(days) or EPOCH, end
+def history_range() -> tuple[datetime, datetime]:
+    return EPOCH, datetime.now(timezone.utc) + timedelta(days=1)
+
+
+def from_epoch(epoch: int | float) -> datetime:
+    return datetime.fromtimestamp(int(epoch), timezone.utc).replace(tzinfo=None)
 
 
 def as_server_time(value: datetime | None) -> datetime | None:

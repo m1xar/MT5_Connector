@@ -10,7 +10,7 @@ from db.session import async_session_factory
 from domain.enums import SyncKind
 from domain.models import MT5Account
 from pool.manager import PoolManager
-from pool.protocol import PRIORITY_HARD, PRIORITY_SCHEDULED, SyncResult
+from pool.protocol import SyncResult
 from repositories.account_repo import AccountRepository
 from repositories.position_repo import OpenPositionRepository, PositionRepository
 from repositories.transaction_repo import TransactionRepository
@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 class SyncService:
     def __init__(self, pool: PoolManager) -> None:
         self.pool = pool
+        self._submit_lock = asyncio.Lock()
 
     async def request(
         self,
@@ -33,33 +34,29 @@ class SyncService:
         kind: SyncKind,
         dedupe: bool = False,
         connect_timeout_ms: int | None = None,
-    ) -> tuple[str, "asyncio.Future[SyncResult]"]:
-        if dedupe:
-            pending = self.pool.pending_for(account.account_id)
-            if pending is not None:
-                log_event(logger, "debug", "sync.request.deduped", account_id=account.account_id)
-                run_id, future = pending
-                return run_id or str(uuid.uuid4()), future
+    ) -> asyncio.Future[SyncResult]:
+        async with self._submit_lock:
+            if dedupe:
+                pending = self.pool.pending_for(account.account_id)
+                if pending is not None:
+                    log_event(logger, "debug", "sync.request.deduped", account_id=account.account_id)
+                    return pending
 
-        sync_run_id = str(uuid.uuid4())
-        terminal_path = await ensure_assigned(session, account, self.pool.terminal_paths)
-        already_measured = frozenset(
-            await PositionRepository(session).measured_external_ids(account.account_id)
-        )
-        future = self.pool.submit(
-            account_id=account.account_id,
-            login=account.login,
-            password=account.password,
-            server=account.server,
-            terminal_path=terminal_path,
-            priority=PRIORITY_HARD if kind in (SyncKind.hard, SyncKind.initial) else PRIORITY_SCHEDULED,
-            kind=kind,
-            sync_run_id=sync_run_id,
-            connect_timeout_ms=connect_timeout_ms,
-            already_measured=already_measured,
-            max_retries=0 if kind == SyncKind.initial else None,
-        )
-        return sync_run_id, future
+            terminal_path = await ensure_assigned(session, account, self.pool.terminal_paths)
+            already_measured = frozenset(
+                await PositionRepository(session).measured_external_ids(account.account_id)
+            )
+            return self.pool.submit(
+                account_id=account.account_id,
+                login=account.login,
+                password=account.password,
+                server=account.server,
+                terminal_path=terminal_path,
+                kind=kind,
+                sync_run_id=str(uuid.uuid4()),
+                connect_timeout_ms=connect_timeout_ms,
+                already_measured=already_measured,
+            )
 
     async def run_scheduler(self) -> None:
         while True:
@@ -74,7 +71,7 @@ class SyncService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log_event(logger, "error", "scheduler.tick.failed", error=str(exc))
+                log_event(logger, "error", "scheduler.tick.failed", error=f"{type(exc).__name__}: {exc}")
 
     async def persist(self, result: SyncResult) -> None:
         tokens = bind_context(sync_run_id=result.sync_run_id, worker_id=result.worker_id, account_id=result.account_id)
@@ -93,14 +90,14 @@ class SyncService:
         account_repo = AccountRepository(session)
         account = await account_repo.get(result.account_id)
         if account is None:
-            log_event(logger, "warning", "sync.persist.account_missing", account_id=result.account_id)
+            log_event(logger, "warning", "sync.persist.account_missing")
             return
 
         if not result.ok or result.payload is None:
             await account_repo.mark_error(
                 account,
                 result.error or "unknown error",
-                initial=result.kind == SyncKind.initial,
+                initial=result.kind is SyncKind.initial,
                 threshold=settings.account_error_threshold,
             )
             log_event(

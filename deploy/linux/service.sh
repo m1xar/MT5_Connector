@@ -7,7 +7,10 @@
 #   sudo bash deploy/linux/service.sh logs
 #
 # There are two units, not one: the terminals need an X display to start at
-# all, so Xvfb is its own service that mt5api depends on.
+# all, so Xvfb is its own service that mt5api depends on. A unit for the
+# display that already exists is left alone - another service on the box may
+# own it. The launch command lives in a runner script because systemd strips
+# backslashes out of ExecStart, which mangles every Windows path.
 
 set -euo pipefail
 
@@ -21,18 +24,18 @@ LOG="$ROOT/logs/mt5api.log"
 
 case "$ACTION" in
   logs)    exec tail -f "$LOG" ;;
-  restart) systemctl restart mt5api; sleep 5; systemctl is-active mt5api; exit 0 ;;
-  status)  systemctl status xvfb mt5api --no-pager -l; exit 0 ;;
+  restart) systemctl restart mt5api; sleep 5; systemctl is-active mt5api ;;
+  status)  systemctl status xvfb mt5api --no-pager -l ;;
+  install) ;;
+  *) echo "usage: $0 install|restart|status|logs" >&2; exit 1 ;;
 esac
+[ "$ACTION" = install ] || exit 0
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 [ -f "$APP_DIR/.env" ] || { echo "no .env at $APP_DIR/.env" >&2; exit 1; }
 
 mkdir -p "$ROOT/bin" "$ROOT/logs"
 
-# systemd strips backslashes out of ExecStart, which mangles every Windows
-# path it is given. Keeping the actual command in a script avoids the whole
-# question.
 cat > "$RUNNER" <<EOF
 #!/bin/bash
 export WINEPREFIX="$PREFIX"
@@ -45,8 +48,6 @@ exec wine 'C:\Python312\python.exe' 'C:\app\main.py'
 EOF
 chmod +x "$RUNNER"
 
-# Another service on the same box may already own the display; leave a
-# unit that exists alone rather than rewriting it under someone else.
 [ -f /etc/systemd/system/xvfb.service ] || cat > /etc/systemd/system/xvfb.service <<EOF
 [Unit]
 Description=Xvfb virtual display :$DISPLAY_NUM

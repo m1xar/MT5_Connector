@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 from domain.enums import SyncKind
 from domain.fx import SyncPayload
@@ -29,9 +27,9 @@ class SyncTask:
     password: str
     server: str
     kind: SyncKind = SyncKind.scheduled
-    sync_run_id: Optional[str] = None
-    connect_timeout_ms: Optional[int] = None
-    already_measured: frozenset = frozenset()
+    sync_run_id: str | None = None
+    connect_timeout_ms: int | None = None
+    already_measured: frozenset[str] = frozenset()
 
 
 @dataclass(slots=True)
@@ -39,34 +37,11 @@ class SyncResult:
     task_id: str
     account_id: str
     ok: bool
-    payload: Optional[SyncPayload] = None
-    error: Optional[str] = None
-    error_code: Optional[int] = None
+    payload: SyncPayload | None = None
+    error: str | None = None
+    error_code: int | None = None
     terminal_lost: bool = False
     duration_ms: int = 0
-    worker_id: Optional[str] = None
-    sync_run_id: Optional[str] = None
+    worker_id: str | None = None
+    sync_run_id: str | None = None
     kind: SyncKind = SyncKind.scheduled
-
-
-@dataclass(slots=True)
-class WorkerStatus:
-    worker_id: str
-    terminal_path: str
-    state: WorkerState
-    pid: Optional[int] = None
-    current_account_id: Optional[str] = None
-    current_task_started_at: Optional[datetime] = None
-    tasks_completed: int = 0
-    tasks_failed: int = 0
-    restarts: int = 0
-    last_error: Optional[str] = None
-    queue_depth: int = 0
-
-
-@dataclass(slots=True)
-class PoolStatus:
-    workers: list[WorkerStatus] = field(default_factory=list)
-    queue_depth: int = 0
-    hard_sync_queue_depth: int = 0
-    idle_workers: int = 0

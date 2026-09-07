@@ -8,14 +8,14 @@ from ..numbers import abs8, round8, weighted_price
 from .orders import build_orders, build_orders_from_deals, trade_side
 
 
-def sort_deals(deals: list[raw.RawDeal]) -> list[raw.RawDeal]:
+def _sort_deals(deals: list[raw.RawDeal]) -> list[raw.RawDeal]:
     return sorted(deals, key=lambda deal: (deal.time_msc, deal.ticket))
 
 
-def balance_after_close(deals: list[raw.RawDeal], current_balance: float) -> dict[int, float]:
+def _balance_after_close(deals: list[raw.RawDeal], current_balance: float) -> dict[int, float]:
     running = round8(current_balance - sum(deal.balance_delta for deal in deals))
     balances: dict[int, float] = {}
-    for deal in sort_deals(deals):
+    for deal in _sort_deals(deals):
         running = round8(running + deal.balance_delta)
         if deal.is_trading and deal.position_id and deal.is_closing:
             balances[deal.position_id] = running
@@ -38,11 +38,11 @@ def build_fx_positions(
         if order.position_id:
             grouped_orders.setdefault(order.position_id, []).append(order)
 
-    close_balances = balance_after_close(deals, current_balance)
+    close_balances = _balance_after_close(deals, current_balance)
 
     positions: list[fx.FXPosition] = []
     for position_id, position_deals in grouped_deals.items():
-        ordered = sort_deals(position_deals)
+        ordered = _sort_deals(position_deals)
         if not any(deal.is_closing for deal in ordered):
             continue
         positions.append(_build_fx_position(

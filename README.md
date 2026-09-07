@@ -132,7 +132,7 @@ of two price distances, so the money factor cancels — it is still answered whe
 the factor cannot be recovered at all. Both stay `None` without a stop loss. `NetPnl` is used rather than `Pnl`, so RR reflects what the trader
 actually kept after commission and swap.
 
-Because RR must measure the *original* risk, `_extract_protection` keeps the
+Because RR must measure the *original* risk, `_protection` keeps the
 **first** stop loss it sees, not the last — otherwise a stop trailed to
 breakeven would erase the risk it was taken with. This is a deliberate
 divergence from the Go version, which keeps the last.
@@ -146,7 +146,7 @@ orchestrator/
   routes/           accounts.py  sync.py  data.py  pool.py
 
 pool/
-  manager.py        one priority queue and one dispatcher per terminal; terminal affinity
+  manager.py        one priority queue and one dispatcher per terminal; routes by the pinned path
   worker_handle.py  one worker process: spawn, pipe, restart ladder, counters
   worker.py         runs inside the child; one terminal, one task at a time
   protocol.py       what crosses the pipe
@@ -165,10 +165,10 @@ mt5api/
 
 domain/             fx.py (canonical models and SyncPayload), models.py (tables), enums.py
 repositories/       queries and flush, no commits
-services/           transaction boundaries: account, sync (with the scheduler), query; terminal_affinity
+services/           transaction boundaries: account, sync (with the scheduler), query; terminal_affinity picks the pin
 utils/              config, logging
 
-deploy/             open-master, clone, prune-history
+deploy/             open-master, clone, prune-history (Windows); linux/ install, make-master, clone-pool, service, verify-pool
 ```
 
 ## Endpoints
@@ -473,6 +473,13 @@ A failed cold start behaves the same way: `terminal64.exe` stays up with no
 account, and the next `initialize()` on that path attaches to it in under a
 second rather than starting another.
 
+**A pinned terminal that is down makes its accounts wait, initial syncs
+included.** Registering an account whose terminal is `failed` queues the
+initial sync behind the reaper; if the terminal never comes back the request
+answers 502 after `MT5_API_HARD_SYNC_WAIT_TIMEOUT_SECONDS` with the account
+still `active` and never synced, and the scheduler picks it up once the
+terminal is. Only an attempt that actually ran marks `error_connection`.
+
 **An initial sync gets one attempt.** On the account's terminal, then the
 account is `error_connection` and the caller gets 502 — even when that terminal
 turns out to be dead. Every clone shares the master's server list, so a server
@@ -687,7 +694,7 @@ sits beside them — falling back to `D:\MT5`. That is what makes
 ```powershell
 pip install -r requirements.txt
 copy .env.example .env      # then edit it
-python -m orchestrator.app
+python main.py
 ```
 
 The settings that decide whether it works at all:
@@ -852,8 +859,10 @@ exits non-zero if the last one still fails, so it can gate a deploy.
 Two Linux-specific settings worth raising in `.env`: importing the worker under
 Wine costs ~20 s per process, so twelve workers spawning at once do not all
 report within the default 120 s start window; set
-`MT5_API_WORKER_START_TIMEOUT_SECONDS=300`. The pool's reaper restarts any that
-missed it, one a minute, so the service still fills up — just slower.
+`MT5_API_WORKER_START_TIMEOUT_SECONDS=300`. Workers are spawned four at a time
+for the same reason, and the reaper restarts whatever failed the same way once
+a minute; measured on 8 cores, sixteen terminals were all up in under seven
+minutes.
 
 ## Verifying
 

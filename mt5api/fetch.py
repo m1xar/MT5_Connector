@@ -17,7 +17,8 @@ from .raw import (
     RawOrder,
     RawPosition,
 )
-from .terminal import HistoryNotReady, MT5Terminal, TerminalError
+from .enrichment import DAY, MINUTE
+from .terminal import HistoryNotReady, MT5Terminal, is_ipc
 from .timeutil import as_mt5_time, as_server_time, history_range
 
 logger = logging.getLogger(__name__)
@@ -31,9 +32,9 @@ _CLOCK_TTL_TICK_ONLY = 300.0
 _CLOCK_TTL_UNKNOWN = 6 * 3600.0
 _CLOCK_SYMBOLS = 4
 _clock_cache: dict[str, tuple[float, ServerClock]] = {}
-_clock_misses: dict[tuple[str, tuple[str, ...]], float] = {}
+_clock_misses: dict[str, float] = {}
 
-_TIMEFRAMES = {"1m": TIMEFRAME_M1, "1d": TIMEFRAME_D1}
+_TIMEFRAMES = {MINUTE: TIMEFRAME_M1, DAY: TIMEFRAME_D1}
 
 
 def fetch_account(terminal: MT5Terminal) -> RawAccount:
@@ -44,19 +45,13 @@ def fetch_account(terminal: MT5Terminal) -> RawAccount:
     return RawAccount.from_mt5(info)
 
 
-def fetch_deals(terminal: MT5Terminal) -> list[RawDeal]:
-    start, end = history_range()
-    rows = terminal.check_call(
-        terminal.mt5.history_deals_get(as_mt5_time(start), as_mt5_time(end)), "history_deals_get"
-    )
+def fetch_deals(terminal: MT5Terminal, start: datetime, end: datetime) -> list[RawDeal]:
+    rows = terminal.check_call(terminal.mt5.history_deals_get(start, end), "history_deals_get")
     return [RawDeal.from_mt5(row) for row in rows]
 
 
-def fetch_orders(terminal: MT5Terminal) -> list[RawOrder]:
-    start, end = history_range()
-    rows = terminal.check_call(
-        terminal.mt5.history_orders_get(as_mt5_time(start), as_mt5_time(end)), "history_orders_get"
-    )
+def fetch_orders(terminal: MT5Terminal, start: datetime, end: datetime) -> list[RawOrder]:
+    rows = terminal.check_call(terminal.mt5.history_orders_get(start, end), "history_orders_get")
     return [RawOrder.from_mt5(row) for row in rows]
 
 
@@ -70,15 +65,21 @@ def fetch_open_orders(terminal: MT5Terminal) -> list[RawOrder]:
     return [RawOrder.from_mt5(row) for row in rows]
 
 
-def wait_for_history(terminal: MT5Terminal, account: RawAccount, *, timeout_seconds: float = 30.0) -> int:
-    start, end = history_range()
-    start, end = as_mt5_time(start), as_mt5_time(end)
+def wait_for_history(
+    terminal: MT5Terminal, account: RawAccount, start: datetime, end: datetime, *, timeout_seconds: float
+) -> None:
     started = time.monotonic()
     deadline = started + timeout_seconds
     previous: int | None = None
     stable = 0
     while True:
-        total = terminal.mt5.history_deals_total(start, end) or 0
+        total = terminal.mt5.history_deals_total(start, end)
+        if total is None:
+            code, description = terminal.mt5.last_error()
+            if is_ipc(code):
+                raise terminal.failure(f"history_deals_total failed: {description}", code)
+            time.sleep(_SETTLE_POLL_SECONDS)
+            continue
         if total == previous:
             stable += 1
         else:
@@ -102,7 +103,6 @@ def wait_for_history(terminal: MT5Terminal, account: RawAccount, *, timeout_seco
         logger, "info", "terminal.history.settled",
         login=account.login, deals=total, waited_ms=int((time.monotonic() - started) * 1000),
     )
-    return total
 
 
 def _clock_symbols(deals: list[RawDeal]) -> list[str]:
@@ -128,8 +128,7 @@ def fetch_clock(terminal: MT5Terminal, server: str, symbols: list[str]) -> Serve
             )
             return cached[1]
 
-    key = (server, tuple(symbols))
-    missed = _clock_misses.get(key)
+    missed = _clock_misses.get(server)
     if missed is not None and now - missed < _CLOCK_TTL_UNKNOWN:
         log_event(
             logger, "info", "terminal.clock.unknown.reused",
@@ -140,11 +139,10 @@ def fetch_clock(terminal: MT5Terminal, server: str, symbols: list[str]) -> Serve
     clock = measure_server_clock(terminal, symbols=symbols)
     if clock.known:
         _clock_cache[server] = (now, clock)
-        for stale in [k for k in _clock_misses if k[0] == server]:
-            del _clock_misses[stale]
+        _clock_misses.pop(server, None)
         return clock
 
-    _clock_misses[key] = now
+    _clock_misses[server] = now
     if cached is not None:
         log_event(
             logger, "warning", "terminal.clock.stale_kept",
@@ -154,11 +152,12 @@ def fetch_clock(terminal: MT5Terminal, server: str, symbols: list[str]) -> Serve
     return clock
 
 
-def fetch_history(terminal: MT5Terminal, *, settle_timeout_seconds: float = 30.0) -> RawHistory:
+def fetch_history(terminal: MT5Terminal, *, settle_timeout_seconds: float) -> RawHistory:
+    start, end = (as_mt5_time(edge) for edge in history_range())
     account = fetch_account(terminal)
-    wait_for_history(terminal, account, timeout_seconds=settle_timeout_seconds)
-    deals = fetch_deals(terminal)
-    orders = fetch_orders(terminal)
+    wait_for_history(terminal, account, start, end, timeout_seconds=settle_timeout_seconds)
+    deals = fetch_deals(terminal, start, end)
+    orders = fetch_orders(terminal, start, end)
     open_positions = fetch_open_positions(terminal)
     clock = fetch_clock(terminal, account.server, _clock_symbols(deals))
     open_orders = fetch_open_orders(terminal)

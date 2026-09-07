@@ -42,7 +42,7 @@ def call(base, token, method, path, timeout=600):
         except ValueError:
             body = raw[:300]
         return exc.code, body, time.time() - started
-    except Exception as exc:  # noqa: BLE001 - a warm-up must not die on one account
+    except Exception as exc:
         return 0, repr(exc)[:200], time.time() - started
 
 
@@ -75,7 +75,7 @@ def main() -> int:
         return 2
     print(f"{len(ids)} active accounts, {args.parallel} in parallel")
 
-    failures = []
+    failures: list[str] = []
     for round_no in range(1, args.rounds + 1):
         failures = []
         durations = []

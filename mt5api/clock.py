@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo
 
 from utils.logging import log_event
 
+from .timeutil import as_server_time, from_epoch
+
 logger = logging.getLogger(__name__)
 
 UTC = datetime.timezone.utc
@@ -43,14 +45,6 @@ class _Scan(NamedTuple):
     continuous: bool
 
 
-def _label(epoch: Any) -> datetime.datetime:
-    return datetime.datetime.fromtimestamp(int(epoch), UTC).replace(tzinfo=None)
-
-
-def _naive(value: datetime.datetime) -> datetime.datetime:
-    return value.replace(tzinfo=None) if value.tzinfo is not None else value
-
-
 def _new_york_close(day: datetime.date) -> datetime.datetime:
     return (
         datetime.datetime.combine(day, datetime.time(_CLOSE_HOUR), tzinfo=_NEW_YORK)
@@ -65,12 +59,12 @@ class ServerClock:
     scanned: bool = False
 
     @classmethod
-    def from_rows(cls, rows: Sequence[Any] | None) -> "ServerClock":
+    def from_rows(cls, rows: Sequence[Any] | None) -> ServerClock:
         steps = []
         for at, minutes in rows or ():
             if isinstance(at, str):
                 at = datetime.datetime.fromisoformat(at)
-            steps.append((_naive(at), int(minutes)))
+            steps.append((as_server_time(at), int(minutes)))
         steps.sort()
         return cls(steps=tuple(steps))
 
@@ -89,7 +83,7 @@ class ServerClock:
     def offset_at(self, value: datetime.datetime | None) -> int | None:
         if value is None:
             return None
-        label = _naive(value)
+        label = as_server_time(value)
         for at, minutes in reversed(self.steps):
             if label >= at:
                 return minutes
@@ -99,12 +93,12 @@ class ServerClock:
         minutes = self.offset_at(value)
         if value is None or minutes is None:
             return None
-        return (_naive(value) - datetime.timedelta(minutes=minutes)).replace(tzinfo=UTC)
+        return (as_server_time(value) - datetime.timedelta(minutes=minutes)).replace(tzinfo=UTC)
 
     def to_server(self, value: datetime.datetime | None) -> datetime.datetime | None:
         if value is None:
             return None
-        instant = _naive(value.astimezone(UTC)) if value.tzinfo is not None else value
+        instant = as_server_time(value.astimezone(UTC)) if value.tzinfo is not None else value
         for at, minutes in reversed(self.steps):
             if instant + datetime.timedelta(minutes=minutes) >= at:
                 return value + datetime.timedelta(minutes=minutes)
@@ -126,7 +120,7 @@ def _market_is_open(now: datetime.datetime) -> bool:
     return open_ <= now <= close
 
 
-def _current_week_label(offset_minutes: int) -> datetime.datetime:
+def _current_weekfrom_epoch(offset_minutes: int) -> datetime.datetime:
     now = datetime.datetime.now(UTC).replace(tzinfo=None)
     week_open, _ = _week_bounds_utc(now)
     if week_open > now:
@@ -134,7 +128,7 @@ def _current_week_label(offset_minutes: int) -> datetime.datetime:
     return week_open + datetime.timedelta(minutes=offset_minutes)
 
 
-def measure_offset_from_tick(
+def _offset_from_tick(
     terminal: Any, symbols: Iterable[str], *, continuous: Collection[str] = ()
 ) -> int | None:
     now = datetime.datetime.now(UTC).replace(tzinfo=None)
@@ -149,7 +143,7 @@ def measure_offset_from_tick(
             continue
         if tick is None or not getattr(tick, "time", 0):
             continue
-        minutes = (_label(tick.time) - now).total_seconds() / 60.0
+        minutes = (from_epoch(tick.time) - now).total_seconds() / 60.0
         if abs(minutes) > _MAX_OFFSET_MINUTES:
             continue
         return int(round(minutes / 60.0) * 60)
@@ -174,7 +168,7 @@ def _weekends(bars: Any) -> list[_Weekend]:
     for before, after in zip(times, times[1:]):
         if after - before < _MIN_GAP_HOURS * 3600:
             continue
-        closed_at = _label(before) + datetime.timedelta(hours=1)
+        closed_at = from_epoch(before) + datetime.timedelta(hours=1)
         close = _friday_close_utc(closed_at)
         if close is None:
             continue
@@ -183,7 +177,7 @@ def _weekends(bars: Any) -> list[_Weekend]:
             continue
         readings.append(_Weekend(
             closed_at=closed_at,
-            opens_at=_label(after),
+            opens_at=from_epoch(after),
             offset_minutes=int(round(minutes / _ROUND_TO_MINUTES) * _ROUND_TO_MINUTES),
         ))
     return readings
@@ -213,7 +207,8 @@ def _scan_symbol(terminal: Any, symbol: str) -> _Scan:
     deadline = time.monotonic() + _SYMBOL_WAIT_SECONDS
     while True:
         try:
-            terminal.mt5.symbol_select(symbol, True)
+            if not terminal.mt5.symbol_select(symbol, True):
+                return _Scan(None, 0, continuous=False)
             bars = terminal.mt5.copy_rates_from_pos(symbol, terminal.mt5.TIMEFRAME_H1, 0, _SCAN_BARS)
         except Exception:
             bars = None
@@ -221,7 +216,7 @@ def _scan_symbol(terminal: Any, symbol: str) -> _Scan:
         if bars is not None and len(bars) >= 2:
             weekends = _weekends(bars)
             if len(weekends) >= _MIN_WEEKENDS:
-                clock = ServerClock(steps=_steps(_label(bars[0]["time"]), weekends), scanned=True)
+                clock = ServerClock(steps=_steps(from_epoch(bars[0]["time"]), weekends), scanned=True)
                 if clock.known:
                     return _Scan(clock, len(weekends), continuous=False)
             if len(bars) >= _SCAN_BARS:
@@ -258,12 +253,12 @@ def measure_server_clock(terminal: Any, symbols: Iterable[str] = ()) -> ServerCl
         scanned, scanned_symbol, scanned_weekends, scanned_waited = scan.clock, symbol, scan.weekends, waited
         break
 
-    live = measure_offset_from_tick(terminal, candidates, continuous=continuous)
+    live = _offset_from_tick(terminal, candidates, continuous=continuous)
 
     if scanned is not None:
         clock = scanned
         if live is not None and live != clock.offset_minutes:
-            clock = ServerClock(steps=clock.steps + ((_current_week_label(live), live),), scanned=True)
+            clock = ServerClock(steps=clock.steps + ((_current_weekfrom_epoch(live), live),), scanned=True)
             log_event(
                 logger, "info", "terminal.clock.tick.pinned",
                 symbol=scanned_symbol, from_bars=clock.steps[-2][1], from_tick=live,
@@ -278,7 +273,7 @@ def measure_server_clock(terminal: Any, symbols: Iterable[str] = ()) -> ServerCl
         return clock
 
     if live is not None:
-        clock = ServerClock(steps=((_current_week_label(live), live),))
+        clock = ServerClock(steps=((_current_weekfrom_epoch(live), live),))
         log_event(
             logger, "warning", "terminal.clock.from_tick",
             offset_minutes=live, valid_from=clock.steps[0][0].isoformat(), tried=len(candidates),

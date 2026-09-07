@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from typing import Any
 
@@ -13,16 +12,15 @@ RES_S_OK = 1
 IPC_ERROR_CEILING = -10000
 AUTHORIZATION_FAILED = -6
 
-_START_LOCK_WAIT_SECONDS = 120.0
 _START_LOCK_HOLD_SECONDS = 20.0
 
 
-def _is_ipc(code: int | None) -> bool:
+def is_ipc(code: int | None) -> bool:
     return code is not None and code <= IPC_ERROR_CEILING
 
 
 def _diagnose(code: int | None, server: str) -> str:
-    if _is_ipc(code):
+    if is_ipc(code):
         return (
             f" - the terminal never answered within the timeout, so it never got "
             f"as far as logging in: usually {server!r} is not one of the servers "
@@ -51,8 +49,7 @@ class StartGate:
         self._since = ctx.Value("d", 0.0)
 
     def acquire(self) -> bool:
-        deadline = time.monotonic() + _START_LOCK_WAIT_SECONDS
-        while time.monotonic() < deadline:
+        while True:
             if self._lock.acquire(timeout=1.0):
                 self._since.value = time.time()
                 return True
@@ -60,7 +57,6 @@ class StartGate:
             if since and time.time() - since >= _START_LOCK_HOLD_SECONDS:
                 self._since.value = time.time()
                 return False
-        return False
 
     def release(self, acquired: bool) -> None:
         if acquired:
@@ -84,7 +80,6 @@ class MT5Terminal:
         self.portable = portable
         self.start_gate = start_gate
         self._mt5: Any | None = None
-        self._lock = threading.Lock()
         self._current_login: tuple[int, str, str] | None = None
 
     @property
@@ -94,25 +89,24 @@ class MT5Terminal:
         return self._mt5
 
     def connect(self, login: int, password: str, server: str, *, timeout_ms: int | None = None) -> None:
-        with self._lock:
-            if self._mt5 is not None:
-                if self._current_login != (login, server, password):
-                    self._login(login, password, server, timeout_ms or self.login_timeout_ms)
-                return
-            if self.start_gate is None:
-                self._start(login, password, server, timeout_ms or self.init_timeout_ms)
-                return
-            waited = time.monotonic()
-            acquired = self.start_gate.acquire()
-            if not acquired:
-                log_event(
-                    logger, "info", "terminal.start.unserialised",
-                    path=self.path, waited_s=round(time.monotonic() - waited, 1),
-                )
-            try:
-                self._start(login, password, server, timeout_ms or self.init_timeout_ms)
-            finally:
-                self.start_gate.release(acquired)
+        if self._mt5 is not None:
+            if self._current_login != (login, password, server):
+                self._login(login, password, server, timeout_ms or self.login_timeout_ms)
+            return
+        if self.start_gate is None:
+            self._start(login, password, server, timeout_ms or self.init_timeout_ms)
+            return
+        waited = time.monotonic()
+        acquired = self.start_gate.acquire()
+        if not acquired:
+            log_event(
+                logger, "info", "terminal.start.unserialised",
+                path=self.path, waited_s=round(time.monotonic() - waited, 1),
+            )
+        try:
+            self._start(login, password, server, timeout_ms or self.init_timeout_ms)
+        finally:
+            self.start_gate.release(acquired)
 
     def _start(self, login: int, password: str, server: str, timeout_ms: int) -> None:
         try:
@@ -127,7 +121,7 @@ class MT5Terminal:
             code, description = module.last_error()
             raise self.failure(f"initialize failed for {login}@{server}: {description}{_diagnose(code, server)}", code)
         self._mt5 = module
-        self._current_login = (login, server, password)
+        self._current_login = (login, password, server)
         log_event(
             logger, "info", "terminal.initialize.completed",
             path=self.path, portable=self.portable, login=login, server=server, timeout_ms=timeout_ms,
@@ -138,7 +132,7 @@ class MT5Terminal:
         if not self.mt5.login(login, password=password, server=server, timeout=timeout_ms):
             code, description = self.mt5.last_error()
             raise self.failure(f"login failed for {login}@{server}: {description}{_diagnose(code, server)}", code)
-        self._current_login = (login, server, password)
+        self._current_login = (login, password, server)
         log_event(logger, "info", "terminal.login.completed", login=login, server=server)
 
     def forget_login(self) -> None:
@@ -146,7 +140,7 @@ class MT5Terminal:
 
     def failure(self, message: str, code: int | None) -> TerminalError:
         lost = False
-        if _is_ipc(code) and self._mt5 is not None:
+        if is_ipc(code) and self._mt5 is not None:
             lost = self._mt5.terminal_info() is None
             log_event(logger, "warning", "terminal.probe", path=self.path, error_code=code, terminal_lost=lost)
         return TerminalError(message, code=code, terminal_lost=lost)

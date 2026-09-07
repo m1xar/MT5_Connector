@@ -27,11 +27,11 @@ def worker_main(
     login_timeout_ms: int,
     log_level: str,
     log_json: bool,
-    with_mae_mfe: bool = True,
-    portable: bool = False,
-    history_settle_timeout_seconds: float = 30.0,
-    prune_cache_after_sync: bool = False,
-    start_gate: StartGate | None = None,
+    with_mae_mfe: bool,
+    portable: bool,
+    history_settle_timeout_seconds: float,
+    prune_cache_after_sync: bool,
+    start_gate: StartGate,
 ) -> None:
     configure_logging(log_level, log_json)
     terminal = MT5Terminal(
@@ -57,7 +57,7 @@ def worker_main(
                 try:
                     prune_price_cache(terminal_path)
                 except Exception as exc:
-                    log_event(logger, "warning", "cache.prune.failed", worker_id=worker_id, error=str(exc))
+                    log_event(logger, "warning", "worker.cache.prune_failed", worker_id=worker_id, error=f"{type(exc).__name__}: {exc}")
     finally:
         terminal.shutdown()
         log_event(logger, "info", "worker.stopped", worker_id=worker_id)

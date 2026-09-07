@@ -4,11 +4,11 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from utils.logging import log_event
 
-from .protocol import SyncResult, SyncTask, WorkerState, WorkerStatus
+from .protocol import SyncResult, SyncTask, WorkerState
 
 logger = logging.getLogger(__name__)
 
@@ -31,15 +31,23 @@ class WorkerHandle:
     state: WorkerState = WorkerState.starting
     process: Any = None
     connection: Any = None
-    current_account_id: Optional[str] = None
-    current_task_started_at: Optional[datetime] = None
+    current_account_id: str | None = None
+    current_task_started_at: datetime | None = None
     tasks_completed: int = 0
     tasks_failed: int = 0
     restarts: int = 0
-    last_error: Optional[str] = None
+    last_error: str | None = None
     queue: asyncio.PriorityQueue = field(default_factory=asyncio.PriorityQueue)
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     hard_queued: int = 0
+
+    @property
+    def pid(self) -> int | None:
+        return getattr(self.process, "pid", None)
+
+    @property
+    def queue_depth(self) -> int:
+        return self.queue.qsize()
 
     async def spawn(self) -> bool:
         try:
@@ -62,13 +70,16 @@ class WorkerHandle:
         try:
             ready = await asyncio.wait_for(asyncio.to_thread(parent_conn.recv), timeout=self.start_timeout_seconds)
         except (asyncio.TimeoutError, EOFError, OSError) as exc:
-            return await self._start_failed(f"worker did not start: {exc}")
+            return await self._start_failed(f"worker did not start: {type(exc).__name__}: {exc}")
         if ready != self.worker_id:
             return await self._start_failed(f"worker reported {ready!r} instead of ready")
         self.last_error = None
+        self.mark_idle()
         return True
 
     async def restart(self) -> bool:
+        self.state = WorkerState.restarting
+        self.ready.clear()
         await self.terminate()
         for attempt in range(1, _RESTART_ATTEMPTS + 1):
             self.restarts += 1
@@ -126,7 +137,6 @@ class WorkerHandle:
             self.tasks_completed += 1
         else:
             self.tasks_failed += 1
-            self.last_error = result.error
 
     def mark_idle(self) -> None:
         self.state = WorkerState.idle
@@ -135,21 +145,6 @@ class WorkerHandle:
     def mark_failed(self) -> None:
         self.state = WorkerState.failed
         self.ready.clear()
-
-    def status(self) -> WorkerStatus:
-        return WorkerStatus(
-            worker_id=self.worker_id,
-            terminal_path=self.terminal_path,
-            state=self.state,
-            pid=getattr(self.process, "pid", None),
-            current_account_id=self.current_account_id,
-            current_task_started_at=self.current_task_started_at,
-            tasks_completed=self.tasks_completed,
-            tasks_failed=self.tasks_failed,
-            restarts=self.restarts,
-            last_error=self.last_error,
-            queue_depth=self.queue.qsize(),
-        )
 
     async def _start_failed(self, reason: str) -> bool:
         self.last_error = reason

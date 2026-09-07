@@ -9,6 +9,13 @@
 #
 # It does not start the service and does not create the terminal pool.
 # Those are deploy/linux/clone-pool.sh and deploy/linux/service.sh.
+#
+# Wine needs a display even for a terminal nobody looks at; the one started
+# here is only for this install and is stopped on exit, service.sh owns the
+# real one as a systemd unit. WINEDLLOVERRIDES="mscoree,mshtml=" keeps
+# wineboot from blocking forever on the Mono/Gecko dialog. The interpreter has
+# to be a Windows Python: MetaTrader5 only ships as a Windows wheel. .env is
+# never copied - it is per box.
 
 set -euo pipefail
 
@@ -36,11 +43,10 @@ if [ ! -f "/etc/apt/sources.list.d/winehq-${CODENAME}.sources" ]; then
 fi
 apt-get update -qq
 apt-get install -y -qq --install-recommends winehq-stable
-apt-get install -y -qq xvfb unzip curl wget python3 python3-venv
+apt-get install -y -qq xvfb x11-utils unzip curl wget python3 python3-venv
 
 wine --version
 
-# Wine wants a display even to start a terminal that nobody looks at.
 log "Virtual display :$DISPLAY_NUM"
 export DISPLAY=":$DISPLAY_NUM"
 XVFB_PID=""
@@ -50,17 +56,12 @@ if ! xdpyinfo -display ":$DISPLAY_NUM" >/dev/null 2>&1; then
   XVFB_PID=$!
   sleep 3
 fi
-# The display started here is only for this install; service.sh owns the real
-# one as a systemd unit, and a leftover Xvfb would keep that unit from binding.
-trap '[ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null; rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}"' EXIT
+trap '[ -n "$XVFB_PID" ] && { kill "$XVFB_PID" 2>/dev/null; rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}"; }' EXIT
 
 log "Wine prefix at $PREFIX"
 export WINEPREFIX="$PREFIX"
 export WINEARCH=win64
 export WINEDEBUG=-all
-# Without this, wineboot blocks forever on the Mono/Gecko install dialog,
-# which nothing can answer on a headless box. This is the single most
-# common way a Wine setup appears to hang.
 export WINEDLLOVERRIDES="mscoree,mshtml="
 if [ ! -f "$PREFIX/system.reg" ]; then
   wineboot --init
@@ -68,9 +69,6 @@ if [ ! -f "$PREFIX/system.reg" ]; then
 fi
 
 log "Windows build of Python $PY_VERSION inside the prefix"
-# The service imports MetaTrader5, which only exists as a Windows wheel, so
-# the interpreter running it has to be a Windows one - a Linux python3 cannot
-# load it no matter what Wine is installed.
 if ! wine 'C:\Python312\python.exe' -V >/dev/null 2>&1; then
   mkdir -p "$(dirname "$PREFIX")/downloads"
   INSTALLER="$(dirname "$PREFIX")/downloads/python-${PY_VERSION}-amd64.exe"
@@ -84,8 +82,6 @@ wine 'C:\Python312\python.exe' -V
 
 log "Application code into $APP_DIR"
 mkdir -p "$APP_DIR"
-# .env is deliberately excluded: it is per-box, and copying a developer's
-# over a running server's would repoint it at the wrong database.
 tar -C "$REPO_ROOT" \
     --exclude=.git --exclude=.venv --exclude=__pycache__ \
     --exclude='*.log' --exclude=.env \
@@ -103,7 +99,7 @@ Done. Next:
 
   1. Put a master terminal at $PREFIX/drive_c/MT5/master
      (a portable install, already updated to the current build).
-  2. bash deploy/linux/clone-pool.sh 12
+  2. bash deploy/linux/clone-pool.sh 16
   3. Write $APP_DIR/.env  (see .env.example; paths look like C:\\MT5\\t1\\terminal64.exe)
   4. bash deploy/linux/service.sh install
 

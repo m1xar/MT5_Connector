@@ -30,7 +30,7 @@ TRANSACTION_TYPE_WITHDRAWAL = "WITHDRAWAL"
 
 
 class FXBase(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, ser_json_timedelta="iso8601")
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class FXTrade(FXBase):

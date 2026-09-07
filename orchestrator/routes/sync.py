@@ -37,14 +37,14 @@ async def sync_account(
 ):
     account = await load_account(session, account_id)
     kind = SyncKind.hard if wait else SyncKind.scheduled
-    _run_id, future = await service.request(session, account, kind)
+    future = await service.request(session, account, kind)
     await session.close()
 
     if not wait:
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content=SyncQueuedResponse(
-                account_id=account_id, queue_depth=terminal_pool.status().queue_depth
+                account_id=account_id, queue_depth=terminal_pool.queue_depth_for(account.terminal_path)
             ).model_dump(mode="json"),
         )
 

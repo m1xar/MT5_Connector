@@ -29,7 +29,7 @@ def trade_side(deal_type: int) -> str:
     return fx.SIDE_LONG if deal_type == raw.DEAL_TYPE_BUY else fx.SIDE_SHORT
 
 
-def execution_side(deal_type: int) -> str:
+def _execution_side(deal_type: int) -> str:
     return fx.EXEC_SIDE_BUY if deal_type == raw.DEAL_TYPE_BUY else fx.EXEC_SIDE_SELL
 
 
@@ -52,7 +52,7 @@ def _prices(order: raw.RawOrder, kind: str) -> tuple[float, float]:
 def _trade(deal: raw.RawDeal, order_id: str) -> fx.FXTrade:
     return fx.FXTrade(
         order_id=order_id,
-        side=execution_side(deal.type),
+        side=_execution_side(deal.type),
         price=deal.price,
         amount=deal.volume,
         commission=abs8(deal.commission + deal.fee),
@@ -70,7 +70,7 @@ def build_orders(orders: list[raw.RawOrder], deals: list[raw.RawDeal], position_
         kind = _ORDER_TYPES.get(order.type, fx.ORDER_TYPE_MARKET)
         stop_price, original_price = _prices(order, kind)
         if deal is not None:
-            side = execution_side(deal.type)
+            side = _execution_side(deal.type)
         else:
             side = fx.EXEC_SIDE_BUY if order.type % 2 == 0 else fx.EXEC_SIDE_SELL
         built.append(fx.FXOrder(
@@ -99,7 +99,7 @@ def build_orders_from_deals(deals: list[raw.RawDeal], position_id: str) -> list[
             position_id=position_id,
             type=fx.ORDER_TYPE_MARKET,
             status=fx.ORDER_STATUS_FILLED,
-            side=execution_side(deal.type),
+            side=_execution_side(deal.type),
             amount=deal.volume,
             amount_filled=deal.volume,
             average_price=deal.price,

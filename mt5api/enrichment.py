@@ -22,7 +22,7 @@ _TICK = timedelta(microseconds=1)
 _OVERLAP_TOLERANCE = 0.01
 
 
-def value_per_price_unit(position: fx.FXPosition) -> float | None:
+def _value_per_price_unit(position: fx.FXPosition) -> float | None:
     price_delta = position.exit_price - position.entry_price
     if position.side == fx.SIDE_SHORT:
         price_delta = -price_delta
@@ -36,7 +36,7 @@ def value_per_lot(positions: Iterable[fx.FXPosition]) -> dict[str, float]:
     for position in positions:
         if not position.pair or position.pair in rates or not position.amount:
             continue
-        unit = value_per_price_unit(position)
+        unit = _value_per_price_unit(position)
         if unit is not None:
             rates[position.pair] = unit / position.amount
     return rates
@@ -45,7 +45,7 @@ def value_per_lot(positions: Iterable[fx.FXPosition]) -> dict[str, float]:
 def resolve_value_per_price_unit(
     position: fx.FXPosition, per_lot: Mapping[str, float] | None = None
 ) -> float | None:
-    unit = value_per_price_unit(position)
+    unit = _value_per_price_unit(position)
     if unit is not None:
         return unit
     rate = (per_lot or {}).get(position.pair)
@@ -69,7 +69,7 @@ def apply_rr(position: fx.FXPosition, unit: float | None) -> None:
         position.rr = round8(position.net_pnl / risk_money)
 
 
-def apply_mae_mfe(position: fx.FXPosition, high: float, low: float, unit: float | None) -> bool:
+def _apply_mae_mfe(position: fx.FXPosition, high: float, low: float, unit: float | None) -> bool:
     if unit is None:
         return False
     traded_low = min(position.entry_price, position.exit_price)
@@ -134,7 +134,7 @@ def enrich_mae_mfe(
             continue
         high = max(c.high for c in candles)
         low = min(c.low for c in candles)
-        if apply_mae_mfe(position, high, low, resolve_value_per_price_unit(position, per_lot)):
+        if _apply_mae_mfe(position, high, low, resolve_value_per_price_unit(position, per_lot)):
             enriched += 1
         else:
             rejected += 1

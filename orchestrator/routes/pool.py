@@ -17,7 +17,7 @@ router = APIRouter(tags=["Pool"])
     response_model=PoolStatusResponse,
     summary="Terminal pool state",
     description="Per-worker state, how deep each terminal's own queue is, and how many accounts are pinned to it.",
-    responses=COMMON_RESPONSES,
+    responses={401: COMMON_RESPONSES[401]},
     dependencies=[Depends(verify_auth)],
 )
 async def get_pool_status(
@@ -41,7 +41,7 @@ async def healthz(request: Request):
     pool: PoolManager | None = getattr(request.app.state, "pool", None)
     if pool is None:
         return HealthResponse(status="starting", healthy_workers=0, worker_count=0)
-    worker_count = len(pool.status().workers)
+    worker_count = len(pool.terminal_paths)
     healthy = pool.healthy_workers
     if not pool.dispatcher_alive:
         status = "stalled"

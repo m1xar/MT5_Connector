@@ -8,10 +8,10 @@ from utils.logging import log_event
 logger = logging.getLogger(__name__)
 
 
-def prune_price_cache(terminal_path: str) -> tuple[float, int]:
+def prune_price_cache(terminal_path: str) -> None:
     root = Path(terminal_path).parent / "Bases"
     if not root.is_dir():
-        return 0.0, 0
+        return
 
     freed = 0.0
     locked = 0
@@ -35,5 +35,4 @@ def prune_price_cache(terminal_path: str) -> tuple[float, int]:
                 freed += size / 1048576
 
     if freed or locked:
-        log_event(logger, "info", "cache.pruned", terminal=root.parent.name, freed_mb=round(freed, 1), in_use=locked)
-    return round(freed, 1), locked
+        log_event(logger, "info", "worker.cache.pruned", terminal=root.parent.name, freed_mb=round(freed, 1), in_use=locked)

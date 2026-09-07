@@ -13,13 +13,13 @@
 # A terminal that has already run has both halves solved: it downloaded the
 # update and applied it on its next start, and it has accumulated the broker
 # list. Promoting it to master means clones are born current and download
-# nothing on login. It does not make a terminal's first-ever session with a
-# broker deliver deal history - measured, that still needs a second pass
-# (see verify-pool.py) - but it removes the 190 MB download from that pass.
+# nothing on login.
 #
 # What has to come out of it first is the point of this script. A working
 # terminal stores the credentials of every account it has ever logged into
-# in Config/accounts.dat. That file must never travel with a master.
+# in Config/accounts.dat. That file must never travel with a master. Config
+# is capitalised on a portable install, so it is matched case-insensitively
+# rather than silently leaving the credentials behind.
 
 set -euo pipefail
 
@@ -41,8 +41,6 @@ STAGE="$MT5_DIR/.master-staging.$$"
 rm -rf "$STAGE"
 cp -a "$SRC_DIR" "$STAGE"
 
-# Config is capitalised on a portable install. Match it either way rather
-# than silently leaving the credentials behind.
 CONFIG="$(find "$STAGE" -maxdepth 1 -iname config | head -1)"
 [ -n "$CONFIG" ] || { echo "no config directory in $SRC_DIR" >&2; rm -rf "$STAGE"; exit 1; }
 
@@ -50,7 +48,7 @@ rm -f "$CONFIG/accounts.dat" "$CONFIG/dnsperf.dat"
 rm -rf "$STAGE/logs" "$STAGE/Bases" "$STAGE/Tester" "$STAGE/MQL5/Logs"
 mkdir -p "$STAGE/Bases"
 
-if find "$STAGE" -iname accounts.dat | grep -q .; then
+if [ -n "$(find "$STAGE" -iname accounts.dat -print -quit)" ]; then
   echo "refusing to publish a master that still carries accounts.dat" >&2
   rm -rf "$STAGE"; exit 1
 fi
@@ -71,6 +69,6 @@ Master ready at $DEST
   credentials     removed
   size            $(du -sh "$DEST" | cut -f1)
 
-Keep this directory as the deployment artefact. A new box clones from it and
-needs no warm-up at all. Refresh it the same way whenever the build moves on.
+Keep this directory as the deployment artefact. Refresh it the same way
+whenever the build moves on.
 EOF

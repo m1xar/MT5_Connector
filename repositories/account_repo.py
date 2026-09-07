@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
 
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +14,9 @@ def _active(statement):
     return statement.where(MT5Account.enabled.is_(True)).where(MT5Account.status != AccountStatus.error_connection)
 
 
+_DUE_BATCH = 200
+
+
 class AccountRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
@@ -25,17 +27,17 @@ class AccountRepository:
         await self.session.refresh(account)
         return account
 
-    async def get(self, account_id: str) -> Optional[MT5Account]:
+    async def get(self, account_id: str) -> MT5Account | None:
         result = await self.session.execute(select(MT5Account).where(MT5Account.account_id == account_id))
         return result.scalars().first()
 
-    async def get_by_login(self, login: int, server: str) -> Optional[MT5Account]:
+    async def get_by_login(self, login: int, server: str) -> MT5Account | None:
         result = await self.session.execute(
             select(MT5Account).where(MT5Account.login == login).where(MT5Account.server == server)
         )
         return result.scalars().first()
 
-    async def list(self, enabled: bool | None = None, limit: int = 100, offset: int = 0) -> List[MT5Account]:
+    async def list(self, enabled: bool | None = None, limit: int = 100, offset: int = 0) -> list[MT5Account]:
         statement = select(MT5Account)
         if enabled is not None:
             statement = statement.where(MT5Account.enabled == enabled)
@@ -43,13 +45,13 @@ class AccountRepository:
         result = await self.session.execute(statement)
         return list(result.scalars().all())
 
-    async def due_for_sync(self, interval_minutes: int, limit: int = 200) -> List[MT5Account]:
+    async def due_for_sync(self, interval_minutes: int) -> list[MT5Account]:
         threshold = datetime.now(timezone.utc) - timedelta(minutes=interval_minutes)
         statement = (
             _active(select(MT5Account))
             .where(MT5Account.last_synced_at.is_(None) | (MT5Account.last_synced_at < threshold))
             .order_by(MT5Account.last_synced_at.asc().nullsfirst())
-            .limit(limit)
+            .limit(_DUE_BATCH)
         )
         result = await self.session.execute(statement)
         return list(result.scalars().all())

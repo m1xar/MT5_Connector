@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Mapping, Optional
+from typing import Mapping
 
 from pydantic import BaseModel, ConfigDict, computed_field
 
-from pool.protocol import PoolStatus, WorkerState
+from pool.manager import PoolStatus
+from pool.protocol import WorkerState
 
 
 class WorkerStatusResponse(BaseModel):
@@ -14,13 +15,13 @@ class WorkerStatusResponse(BaseModel):
     worker_id: str
     terminal_path: str
     state: WorkerState
-    pid: Optional[int]
-    current_account_id: Optional[str]
-    current_task_started_at: Optional[datetime]
+    pid: int | None
+    current_account_id: str | None
+    current_task_started_at: datetime | None
     tasks_completed: int
     tasks_failed: int
     restarts: int
-    last_error: Optional[str]
+    last_error: str | None
     queue_depth: int
     assigned_accounts: int = 0
 
@@ -28,7 +29,7 @@ class WorkerStatusResponse(BaseModel):
 class PoolStatusResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    workers: List[WorkerStatusResponse]
+    workers: list[WorkerStatusResponse]
     idle_workers: int
     queue_depth: int
     hard_sync_queue_depth: int

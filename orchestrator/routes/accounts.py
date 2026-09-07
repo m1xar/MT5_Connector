@@ -64,7 +64,7 @@ async def create_account(
     except AccountExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    _run_id, future = await service.request(
+    future = await service.request(
         session, account, SyncKind.initial, connect_timeout_ms=settings.terminal_initial_connect_timeout_ms
     )
     await session.close()

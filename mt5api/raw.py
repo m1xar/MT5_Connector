@@ -35,6 +35,8 @@ POSITION_TYPE_SELL = 1
 TIMEFRAME_M1 = 1
 TIMEFRAME_D1 = 16408
 
+from .timeutil import from_epoch
+
 
 def _int(source: Any, name: str) -> int:
     return int(getattr(source, name, 0) or 0)
@@ -52,7 +54,7 @@ def _stamp(msc: int, seconds: int) -> datetime | None:
     if msc:
         return datetime.fromtimestamp(msc / 1000.0, tz=timezone.utc).replace(tzinfo=None)
     if seconds:
-        return datetime.fromtimestamp(seconds, tz=timezone.utc).replace(tzinfo=None)
+        return from_epoch(seconds)
     return None
 
 
