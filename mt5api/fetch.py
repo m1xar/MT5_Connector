@@ -17,7 +17,7 @@ from .raw import (
     RawOrder,
     RawPosition,
 )
-from .terminal import MT5Terminal, TerminalError
+from .terminal import HistoryNotReady, MT5Terminal, TerminalError
 from .timeutil import as_mt5_time, as_server_time, history_range
 
 logger = logging.getLogger(__name__)
@@ -91,7 +91,7 @@ def wait_for_history(terminal: MT5Terminal, account: RawAccount, *, timeout_seco
         if time.monotonic() >= deadline:
             if total > 0 or not account.balance:
                 break
-            raise TerminalError(
+            raise HistoryNotReady(
                 f"no deal history arrived for {account.login} in {timeout_seconds:.0f}s, yet the "
                 f"account holds {account.balance} {account.currency} - the terminal is still "
                 f"downloading, or the history is unavailable"
