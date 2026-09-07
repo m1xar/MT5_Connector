@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,6 +11,8 @@ from repositories.account_repo import AccountRepository
 from repositories.position_repo import OpenPositionRepository, PositionRepository
 from repositories.transaction_repo import TransactionRepository
 from utils.logging import log_event
+
+from .terminal_affinity import pick_terminal
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +26,18 @@ class AccountService:
         self.session = session
         self.repo = AccountRepository(session)
 
-    async def create(self, *, login: int, password: str, server: str) -> MT5Account:
+    async def create(self, *, login: int, password: str, server: str, terminal_paths: Sequence[str]) -> MT5Account:
         if await self.repo.get_by_login(login, server) is not None:
             raise AccountExistsError(f"account {login}@{server} already exists")
-        account = await self.repo.create(MT5Account(login=login, password=password, server=server))
+        terminal_path = pick_terminal(terminal_paths, await self.repo.counts_by_terminal())
+        account = await self.repo.create(
+            MT5Account(login=login, password=password, server=server, terminal_path=terminal_path)
+        )
         await self.session.commit()
-        log_event(logger, "info", "account.created", account_id=account.account_id, login=login)
+        log_event(
+            logger, "info", "account.created",
+            account_id=account.account_id, login=login, terminal_path=terminal_path,
+        )
         return account
 
     async def update(

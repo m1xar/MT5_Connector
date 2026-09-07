@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check that every account syncs cleanly through the pool.
 
-    python3 deploy/linux/warm-pool.py --base http://127.0.0.1:8030 \
+    python3 deploy/linux/verify-pool.py --base http://127.0.0.1:8030 \
         --token "$MT5_API_API_TOKEN" --parallel 12
 
 Runs two rounds of hard syncs over every active account. The first round is

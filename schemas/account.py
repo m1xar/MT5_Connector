@@ -24,6 +24,7 @@ class AccountResponse(BaseModel):
     account_id: str
     login: int
     server: str
+    terminal: Optional[str]
     enabled: bool
     status: AccountStatus
     consecutive_failures: int
@@ -47,6 +48,7 @@ def account_to_response(account: MT5Account) -> AccountResponse:
         account_id=account.account_id,
         login=account.login,
         server=account.server,
+        terminal=account.terminal_path,
         enabled=account.enabled,
         status=account.status,
         consecutive_failures=account.consecutive_failures,

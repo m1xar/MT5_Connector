@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import async_session_factory
 from domain.enums import AccountStatus, SyncKind
+from pool.manager import PoolManager
 from repositories.account_repo import AccountRepository
 from schemas.account import (
     AccountCreateRequest,
@@ -21,7 +22,7 @@ from services.sync_service import SyncService
 from utils.config import settings
 from utils.logging import log_event
 
-from ..deps import COMMON_RESPONSES, ErrorResponse, get_session, get_sync_service, load_account, verify_auth
+from ..deps import COMMON_RESPONSES, ErrorResponse, get_pool, get_session, get_sync_service, load_account, verify_auth
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +37,11 @@ router = APIRouter(tags=["Accounts"], responses=COMMON_RESPONSES, dependencies=[
     description=(
         "The server name must match what the terminals have configured, otherwise "
         "login will fail on every worker.\n\n"
-        "Registering an account queues an **initial sync** ahead of everything "
-        "else in the pool, with a longer connect timeout than a routine sync "
+        "Registering an account pins it to the terminal that currently has the "
+        "fewest active accounts - every sync of this account, now and later, "
+        "runs on that one terminal, and the response reports it as `terminal`. "
+        "It then queues an **initial sync** ahead of everything else on that "
+        "terminal, with a longer connect timeout than a routine sync "
         "gets, and only one attempt at it. If that attempt fails the account is "
         "marked `error_connection` straight away - it has never connected, so "
         "there is nothing for the failure to be a blip in. The request blocks "
@@ -50,9 +54,13 @@ async def create_account(
     data: AccountCreateRequest,
     session: AsyncSession = Depends(get_session),
     service: SyncService = Depends(get_sync_service),
+    terminal_pool: PoolManager = Depends(get_pool),
 ):
     try:
-        account = await AccountService(session).create(login=data.login, password=data.password, server=data.server)
+        account = await AccountService(session).create(
+            login=data.login, password=data.password, server=data.server,
+            terminal_paths=terminal_pool.terminal_paths,
+        )
     except AccountExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

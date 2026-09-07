@@ -17,6 +17,8 @@ from repositories.transaction_repo import TransactionRepository
 from utils.config import settings
 from utils.logging import bind_context, log_event, reset_context
 
+from .terminal_affinity import ensure_assigned
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,6 +42,7 @@ class SyncService:
                 return run_id or str(uuid.uuid4()), future
 
         sync_run_id = str(uuid.uuid4())
+        terminal_path = await ensure_assigned(session, account, self.pool.terminal_paths)
         already_measured = frozenset(
             await PositionRepository(session).measured_external_ids(account.account_id)
         )
@@ -48,6 +51,7 @@ class SyncService:
             login=account.login,
             password=account.password,
             server=account.server,
+            terminal_path=terminal_path,
             priority=PRIORITY_HARD if kind in (SyncKind.hard, SyncKind.initial) else PRIORITY_SCHEDULED,
             kind=kind,
             sync_run_id=sync_run_id,

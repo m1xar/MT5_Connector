@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -37,6 +37,9 @@ class WorkerHandle:
     tasks_failed: int = 0
     restarts: int = 0
     last_error: Optional[str] = None
+    queue: asyncio.PriorityQueue = field(default_factory=asyncio.PriorityQueue)
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    hard_queued: int = 0
 
     async def spawn(self) -> bool:
         try:
@@ -125,6 +128,14 @@ class WorkerHandle:
             self.tasks_failed += 1
             self.last_error = result.error
 
+    def mark_idle(self) -> None:
+        self.state = WorkerState.idle
+        self.ready.set()
+
+    def mark_failed(self) -> None:
+        self.state = WorkerState.failed
+        self.ready.clear()
+
     def status(self) -> WorkerStatus:
         return WorkerStatus(
             worker_id=self.worker_id,
@@ -137,6 +148,7 @@ class WorkerHandle:
             tasks_failed=self.tasks_failed,
             restarts=self.restarts,
             last_error=self.last_error,
+            queue_depth=self.queue.qsize(),
         )
 
     async def _start_failed(self, reason: str) -> bool:
@@ -146,5 +158,5 @@ class WorkerHandle:
             worker_id=self.worker_id, terminal_path=self.terminal_path, error=reason,
         )
         await self.terminate()
-        self.state = WorkerState.failed
+        self.mark_failed()
         return False

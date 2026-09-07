@@ -61,6 +61,7 @@ class WorkerStatus:
     tasks_failed: int = 0
     restarts: int = 0
     last_error: Optional[str] = None
+    queue_depth: int = 0
 
 
 @dataclass(slots=True)

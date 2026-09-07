@@ -34,6 +34,7 @@ class MT5Account(SQLModel, table=True):
     login: int = Field(sa_column=Column(BigInteger, index=True, nullable=False))
     password: str = Field()
     server: str = Field(index=True)
+    terminal_path: Optional[str] = Field(default=None, index=True)
 
     enabled: bool = Field(default=True, index=True)
     status: AccountStatus = Field(default=AccountStatus.active, index=True)

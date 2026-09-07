@@ -125,9 +125,7 @@ class MT5Terminal:
         )
         if not ok:
             code, description = module.last_error()
-            raise TerminalError(
-                f"initialize failed for {login}@{server}: {description}{_diagnose(code, server)}", code=code,
-            )
+            raise self.failure(f"initialize failed for {login}@{server}: {description}{_diagnose(code, server)}", code)
         self._mt5 = module
         self._current_login = (login, server, password)
         log_event(

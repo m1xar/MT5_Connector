@@ -3,8 +3,9 @@
 #
 #   docker compose -f docker-compose.dev.yml up -d
 #
-# Tables are created at startup by SQLModel; there are no migrations, so a
-# schema change means dropping the volume:
+# Tables are created at startup by SQLModel and missing columns are added in
+# place; there are no migrations, so a change to an existing column's type or
+# an enum means dropping the volume:
 #
 #   docker compose -f docker-compose.dev.yml down -v
 

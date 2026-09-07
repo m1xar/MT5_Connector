@@ -43,11 +43,16 @@ wine --version
 # Wine wants a display even to start a terminal that nobody looks at.
 log "Virtual display :$DISPLAY_NUM"
 export DISPLAY=":$DISPLAY_NUM"
+XVFB_PID=""
 if ! xdpyinfo -display ":$DISPLAY_NUM" >/dev/null 2>&1; then
   rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}"
   Xvfb ":$DISPLAY_NUM" -screen 0 1280x1024x24 -nolisten tcp >/tmp/xvfb-install.log 2>&1 &
+  XVFB_PID=$!
   sleep 3
 fi
+# The display started here is only for this install; service.sh owns the real
+# one as a systemd unit, and a leftover Xvfb would keep that unit from binding.
+trap '[ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null; rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}"' EXIT
 
 log "Wine prefix at $PREFIX"
 export WINEPREFIX="$PREFIX"

@@ -18,11 +18,11 @@ it. Two terminals in one process is impossible and threads do not help. So:
 ```
 FastAPI parent (asyncio)          -> Postgres (all normal reads)
  ├─ PoolManager
- │   ├─ asyncio.PriorityQueue     hard sync = 0, scheduled = 1
- │   ├─ idle worker queue         a freed terminal takes the next task
- │   └─ dispatcher
+ │   └─ per terminal: PriorityQueue (hard sync = 0, scheduled = 1) + dispatcher
  ├─ N worker processes            one per terminal, pipe to the parent
  └─ scheduler                     re-queues accounts older than the interval
+
+account.terminal_path             which terminal's queue every sync of it goes to
 
 worker process
   loop: recv task -> terminal.connect(...) -> fetch -> builders -> send models
@@ -33,8 +33,17 @@ without credentials leaves the terminal sitting on its account wizard, where it
 never answers the IPC channel. It comes up on the first task that supplies a
 login, and later tasks switch accounts with `login()`.
 
-The queue lives in the parent because a `multiprocessing.Queue` has no priority
-and a hard sync has to jump the line. Children only ever report "I am free".
+The queues live in the parent because a `multiprocessing.Queue` has no priority
+and a hard sync has to jump the line. There is one per terminal, not one for the
+pool: **every account is pinned to a terminal** when it is registered — the one
+with the fewest active accounts at that moment, reported as `terminal` in the
+account response — and every sync of it, now and later, runs on that terminal
+only. Brokers count logins per device; an account that appears from twelve
+terminals in a day looks like a credential-stuffing run and gets its history
+withheld or its login refused, measured. The pin is the path string from
+`MT5_API_TERMINAL_PATHS`; an account whose path has left the config is re-pinned
+to the least-loaded remaining terminal on its next sync. A hard sync jumps the
+line of its own terminal.
 
 **Hard sync** (`POST /accounts/{id}/sync?wait=true`) is queued at priority 0 and
 its result is returned in the response — already written to the database. Every
@@ -137,7 +146,7 @@ orchestrator/
   routes/           accounts.py  sync.py  data.py  pool.py
 
 pool/
-  manager.py        the priority queue and the dispatcher
+  manager.py        one priority queue and one dispatcher per terminal; terminal affinity
   worker_handle.py  one worker process: spawn, pipe, restart ladder, counters
   worker.py         runs inside the child; one terminal, one task at a time
   protocol.py       what crosses the pipe
@@ -156,7 +165,7 @@ mt5api/
 
 domain/             fx.py (canonical models and SyncPayload), models.py (tables), enums.py
 repositories/       queries and flush, no commits
-services/           transaction boundaries: account, sync (with the scheduler), query
+services/           transaction boundaries: account, sync (with the scheduler), query; terminal_affinity
 utils/              config, logging
 
 deploy/             open-master, clone, prune-history
@@ -174,7 +183,7 @@ deploy/             open-master, clone, prune-history
 | GET | `/accounts/{id}/open-positions` | live exposure as of the last sync |
 | GET | `/accounts/{id}/balance-snapshots?days=N` | derived on read |
 | GET | `/accounts/{id}/transactions?days=N` | deposits/withdrawals |
-| GET | `/pool/status` | per-worker state, queue depth |
+| GET | `/pool/status` | per-worker state, its own queue depth, accounts pinned to it |
 | GET | `/healthz` | public liveness: `ok`, `degraded`, `stalled` |
 
 `days=0` means "everything". `/healthz` reports `degraded` when a terminal is
@@ -209,8 +218,7 @@ An account flips to `error_connection` when either:
   sync ahead of everything else in the pool, with a longer connect timeout
   (`MT5_API_TERMINAL_INITIAL_CONNECT_TIMEOUT_MS`, 120s) than a routine one.
   There is no run of successes for that failure to be a blip in, so one strike
-  is conclusive, and the task is never handed to another terminal either.
-  `POST /accounts` blocks on it and returns the settled status.
+  is conclusive. `POST /accounts` blocks on it and returns the settled status.
 
 The scheduler **skips** `error_connection` accounts. It has to: an account that
 has never synced has `last_synced_at IS NULL`, so it is due on every single
@@ -225,16 +233,21 @@ A sync pool has a failure mode worse than crashing: staying up and quietly
 doing nothing. Every guard below exists to make that impossible or, failing
 that, visible.
 
-**The dispatcher outlives its own bugs.** If the loop that hands tasks to idle
-workers dies, tasks pile up for ever while every worker still reports itself
-healthy. So its body is guarded and it keeps going, and `/healthz` reports it
-separately as `stalled` — a state no worker count can express.
+**A dispatcher outlives its own bugs.** Each terminal has a loop that feeds it
+from its queue; if one died, that terminal's tasks would pile up for ever while
+the worker still reported itself healthy. So its body is guarded and it keeps
+going, and `/healthz` reports any dead loop as `stalled` — a state no worker
+count can express.
 
-**A task always ends.** Anything thrown while running one is caught, the future
-is resolved, and the worker either returns to the idle queue or is marked
-failed. Before, only four exception types were handled; anything else removed a
-terminal from the pool without a word and left the caller waiting out its own
-timeout.
+**A task always ends, and never moves.** Anything thrown while running one is
+caught, the future is resolved, and the worker either becomes ready again or is
+marked failed. A failed worker's queue keeps its tasks and waits: the reaper
+tries a restart once a minute, and the tasks run on that terminal when it is
+back. They are never handed to another terminal — that is the whole point of
+the pin — so a hard sync on a dead terminal times out with 504 while its task
+stays queued. Before, only four exception types were handled; anything else
+removed a terminal from the pool without a word and left the caller waiting out
+its own timeout.
 
 **Failing to spawn is a normal outcome**, not an exception - the restart ladder
 has to keep its footing whether the process would not start or would not
@@ -449,9 +462,9 @@ failed in a tenth of a second. But the same `-10005` comes back from a *live*
 terminal asked to log in to a server it does not know, and measured on one:
 `terminal_info()` answers immediately afterwards and the next `login()` lands
 in 0.7s. So every IPC failure is followed by one `terminal_info()` probe. No
-answer retires the worker process and moves the task to another worker without
-spending a retry — losing a terminal says nothing about the account. An answer
-leaves the terminal alone and the failure is the account's. Before the probe,
+answer retires the worker process, restarts it, and retries the task on the same
+terminal, spending one retry. An answer leaves the terminal alone and the
+failure is the account's. Before the probe,
 one misspelt server name walked through all four workers, reset two terminals
 that had just synced perfectly well, and took eleven minutes to say
 `error_connection`.
@@ -460,11 +473,11 @@ A failed cold start behaves the same way: `terminal64.exe` stays up with no
 account, and the next `initialize()` on that path attaches to it in under a
 second rather than starting another.
 
-**An initial sync never moves.** One attempt, on one terminal, then the account
-is `error_connection` and the caller gets 502 — even when that terminal turns
-out to be dead. Every clone shares the master's server list, so a server one
-cannot reach none can, and a transport failure on the first sync is far more
-often the account than the terminal.
+**An initial sync gets one attempt.** On the account's terminal, then the
+account is `error_connection` and the caller gets 502 — even when that terminal
+turns out to be dead. Every clone shares the master's server list, so a server
+one cannot reach none can, and a transport failure on the first sync is far
+more often the account than the terminal.
 
 **Timeouts.** 30s for a routine connect, on a terminal that is already up and
 only switching accounts. 120s for the first sync of a newly added account, which
@@ -614,9 +627,10 @@ service is any use.
   CREATE DATABASE mt5_api OWNER mt5_api;
   ```
 
-  Tables are created at startup (`SQLModel.metadata.create_all`); there are no
-  migrations, so a change to a column type or an enum needs the database
-  dropped rather than altered.
+  Tables are created at startup (`SQLModel.metadata.create_all`) and a column
+  missing from an existing table is added in place (`db/session.py`). There are
+  no migrations beyond that, so a change to an existing column's type or an
+  enum needs the database dropped rather than altered.
 
 ### 2. The master terminal
 
@@ -680,7 +694,7 @@ The settings that decide whether it works at all:
 
 | setting | note |
 |---|---|
-| `MT5_API_TERMINAL_PATHS` | the number of paths *is* the pool size |
+| `MT5_API_TERMINAL_PATHS` | the number of paths *is* the pool size, and each path string is the key an account is pinned to — rename one and its accounts are re-pinned elsewhere |
 | `MT5_API_TERMINAL_PORTABLE` | must match how the instances were installed; a mismatch sends the terminals to a data directory with no accounts in it |
 | `MT5_API_DATABASE_URL` | |
 | `MT5_API_API_TOKEN` | leaving it empty disables auth on every route but `/healthz` |
@@ -853,9 +867,10 @@ is the reconstruction itself, which needs an account with real trading history:
    low match. A symbol the account has not traded recently may need selecting in
    Market Watch before its history is available.
 3. Queue a bulk sync of 20+ accounts and watch `/pool/status`: every worker
-   busy, the queue draining, and a hard sync fired mid-way coming back first.
+   busy, each terminal's queue draining, and a hard sync fired mid-way coming
+   back first on its own terminal.
 4. Kill one `terminal64.exe` mid-sync — the service should restart that worker
-   and finish the task.
+   and finish the task on it, never on another.
 5. Check the clock: `GET /accounts/{id}` should report a
    `server_utc_offset_minutes` that matches the terminal's own Market Watch
    time. Inside the trading week that comes off a live quote; at the weekend it

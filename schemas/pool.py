@@ -1,31 +1,42 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from datetime import datetime
+from typing import List, Mapping, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, computed_field
 
-from pool.protocol import PoolStatus
+from pool.protocol import PoolStatus, WorkerState
 
 
 class WorkerStatusResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     worker_id: str
     terminal_path: str
-    state: str
+    state: WorkerState
     pid: Optional[int]
     current_account_id: Optional[str]
-    current_task_started_at: Optional[str]
+    current_task_started_at: Optional[datetime]
     tasks_completed: int
     tasks_failed: int
     restarts: int
     last_error: Optional[str]
+    queue_depth: int
+    assigned_accounts: int = 0
 
 
 class PoolStatusResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     workers: List[WorkerStatusResponse]
-    worker_count: int
     idle_workers: int
     queue_depth: int
     hard_sync_queue_depth: int
+
+    @computed_field
+    @property
+    def worker_count(self) -> int:
+        return len(self.workers)
 
 
 class HealthResponse(BaseModel):
@@ -34,27 +45,8 @@ class HealthResponse(BaseModel):
     worker_count: int
 
 
-def pool_status_to_response(status: PoolStatus) -> PoolStatusResponse:
-    return PoolStatusResponse(
-        workers=[
-            WorkerStatusResponse(
-                worker_id=worker.worker_id,
-                terminal_path=worker.terminal_path,
-                state=worker.state.value,
-                pid=worker.pid,
-                current_account_id=worker.current_account_id,
-                current_task_started_at=(
-                    worker.current_task_started_at.isoformat() if worker.current_task_started_at else None
-                ),
-                tasks_completed=worker.tasks_completed,
-                tasks_failed=worker.tasks_failed,
-                restarts=worker.restarts,
-                last_error=worker.last_error,
-            )
-            for worker in status.workers
-        ],
-        worker_count=len(status.workers),
-        idle_workers=status.idle_workers,
-        queue_depth=status.queue_depth,
-        hard_sync_queue_depth=status.hard_sync_queue_depth,
-    )
+def pool_status_to_response(status: PoolStatus, assigned: Mapping[str, int]) -> PoolStatusResponse:
+    response = PoolStatusResponse.model_validate(status)
+    for worker in response.workers:
+        worker.assigned_accounts = assigned.get(worker.terminal_path, 0)
+    return response

@@ -3,11 +3,16 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from domain.enums import AccountStatus
 from domain.models import MT5Account, utc_now
+
+
+def _active(statement):
+    return statement.where(MT5Account.enabled.is_(True)).where(MT5Account.status != AccountStatus.error_connection)
 
 
 class AccountRepository:
@@ -41,15 +46,22 @@ class AccountRepository:
     async def due_for_sync(self, interval_minutes: int, limit: int = 200) -> List[MT5Account]:
         threshold = datetime.now(timezone.utc) - timedelta(minutes=interval_minutes)
         statement = (
-            select(MT5Account)
-            .where(MT5Account.enabled.is_(True))
-            .where(MT5Account.status != AccountStatus.error_connection)
+            _active(select(MT5Account))
             .where(MT5Account.last_synced_at.is_(None) | (MT5Account.last_synced_at < threshold))
             .order_by(MT5Account.last_synced_at.asc().nullsfirst())
             .limit(limit)
         )
         result = await self.session.execute(statement)
         return list(result.scalars().all())
+
+    async def counts_by_terminal(self) -> dict[str, int]:
+        statement = (
+            _active(select(MT5Account.terminal_path, func.count()))
+            .where(MT5Account.terminal_path.is_not(None))
+            .group_by(MT5Account.terminal_path)
+        )
+        result = await self.session.execute(statement)
+        return {path: count for path, count in result.all()}
 
     async def update(self, account: MT5Account) -> MT5Account:
         account.updated_at = utc_now()
@@ -80,7 +92,7 @@ class AccountRepository:
         account.last_synced_at = utc_now()
         return await self.update(account)
 
-    async def mark_error(self, account: MT5Account, error: str, *, initial: bool = False, threshold: int = 3) -> MT5Account:
+    async def mark_error(self, account: MT5Account, error: str, *, initial: bool, threshold: int) -> MT5Account:
         account.consecutive_failures += 1
         account.last_error = error
         if initial or account.consecutive_failures >= threshold:

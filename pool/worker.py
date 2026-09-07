@@ -85,7 +85,6 @@ def _run_task(
             except HistoryNotReady as exc:
                 if attempt == 2:
                     raise
-                terminal.forget_login()
                 log_event(
                     logger, "warning", "worker.history.retry",
                     worker_id=worker_id, account_id=task.account_id, login=task.login, error=str(exc),
