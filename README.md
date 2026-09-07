@@ -4,6 +4,9 @@ Keeps a pool of MetaTrader 5 terminals busy syncing trading accounts into
 **standardized FX models** — the same shapes the Go reconstruction library
 produces for cTrader, so a consumer cannot tell the two sources apart.
 
+It runs on Windows, or on Linux under Wine; the code is the same on both and
+the Linux route is the one in production. See *Deploying*.
+
 ## Why it looks like this
 
 MT5 hands you **deals**, not positions with P&L. Reconstructing positions is the
@@ -34,20 +37,56 @@ never answers the IPC channel. It comes up on the first task that supplies a
 login, and later tasks switch accounts with `login()`.
 
 The queues live in the parent because a `multiprocessing.Queue` has no priority
-and a hard sync has to jump the line. There is one per terminal, not one for the
-pool: **every account is pinned to a terminal** when it is registered — the one
-with the fewest active accounts at that moment, reported as `terminal` in the
-account response — and every sync of it, now and later, runs on that terminal
-only. Brokers count logins per device; an account that appears from twelve
-terminals in a day looks like a credential-stuffing run and gets its history
-withheld or its login refused, measured. The pin is the path string from
-`MT5_API_TERMINAL_PATHS`; an account whose path has left the config is re-pinned
-to the least-loaded remaining terminal on its next sync. A hard sync jumps the
-line of its own terminal.
+and a hard sync has to jump the line. There is one queue per terminal, not one
+for the pool, because **every account is pinned to a terminal** — the next
+section is about that. A hard sync jumps the line of its own terminal.
 
 **Hard sync** (`POST /accounts/{id}/sync?wait=true`) is queued at priority 0 and
 its result is returned in the response — already written to the database. Every
 other endpoint reads from Postgres.
+
+## Terminal affinity
+
+Brokers count logins per device. An account that logs in from many different
+terminals in a short time looks like a credential-stuffing run: measured on
+2026-09-07, five accounts re-logged from a string of freshly cloned terminals
+first stopped receiving their deal history, then three of them got
+`Invalid account` from brokers that had accepted them the day before. Five
+untouched accounts synced through the same terminals in 3–5 s. The pool used to
+hand every sync to whichever worker was idle, so one account visited twelve
+terminals a day.
+
+Now an account is **pinned to one terminal for life**:
+
+* On `POST /accounts` the terminal with the fewest *active* accounts is chosen
+  — active means `enabled` and not `error_connection`, the same filter the
+  scheduler uses — ties broken by the order in `MT5_API_TERMINAL_PATHS`. The
+  choice is stored on the row as `terminal_path` and reported as `terminal`.
+* Every sync of that account, initial, hard or scheduled, is queued on that
+  terminal's own queue and runs on that worker only. A task never moves to
+  another terminal, not on failure, not on restart.
+* The pin is the path string from `MT5_API_TERMINAL_PATHS`. Renaming, reordering
+  or removing a path orphans its accounts; an orphan is re-pinned to the
+  least-loaded remaining terminal on its next sync (`account.terminal.assigned`
+  in the log, `previous` set).
+* `GET /pool/status` shows `assigned_accounts` per worker — active accounts
+  only, so an `error_connection` account frees its slot for the next
+  registration.
+
+What this buys: a pinned account that is still logged in on its terminal needs
+no `login()` at all for its next sync — `connect()` is a no-op when the current
+login matches. On the final check of the 99-account list, 108 syncs cost 120
+logins, one per account plus the re-logins of accounts that share a terminal.
+
+What it costs: a terminal that is down takes its accounts with it until the
+reaper brings it back (see *When the pool goes wrong*). Two registrations that
+land at the same instant can read the same counts and pick the same terminal;
+later picks rebalance, nothing corrects it retroactively.
+
+The retry inside a sync respects the pin too. When the login succeeded but no
+deal history arrived inside the settle window, the worker reads again with a
+window four times longer — in the same session, without logging in again, so
+a retry costs the broker nothing.
 
 ## Data model
 
@@ -129,13 +168,14 @@ RRPlanned = |TP − entry| / |entry − SL|
 
 A trade stopped out for its full risk lands on `RR = -1`. `RRPlanned` is a ratio
 of two price distances, so the money factor cancels — it is still answered when
-the factor cannot be recovered at all. Both stay `None` without a stop loss. `NetPnl` is used rather than `Pnl`, so RR reflects what the trader
-actually kept after commission and swap.
+the factor cannot be recovered at all. Both stay `None` without a stop loss.
+`NetPnl` is used rather than `Pnl`, so RR reflects what the trader actually kept
+after commission and swap.
 
-Because RR must measure the *original* risk, `_protection` keeps the
-**first** stop loss it sees, not the last — otherwise a stop trailed to
-breakeven would erase the risk it was taken with. This is a deliberate
-divergence from the Go version, which keeps the last.
+Because RR must measure the *original* risk, `_protection` keeps the **first**
+stop loss it sees, not the last — otherwise a stop trailed to breakeven would
+erase the risk it was taken with. This is a deliberate divergence from the Go
+version, which keeps the last.
 
 ## Layout
 
@@ -146,10 +186,10 @@ orchestrator/
   routes/           accounts.py  sync.py  data.py  pool.py
 
 pool/
-  manager.py        one priority queue and one dispatcher per terminal; routes by the pinned path
-  worker_handle.py  one worker process: spawn, pipe, restart ladder, counters
-  worker.py         runs inside the child; one terminal, one task at a time
-  protocol.py       what crosses the pipe
+  manager.py        one priority queue and one dispatcher per terminal; batched spawn; the reaper
+  worker_handle.py  one worker process: spawn, pipe, restart ladder, its queue and counters
+  worker.py         runs inside the child; one terminal, one task at a time, the history retry
+  protocol.py       what crosses the pipe: SyncTask, SyncResult, WorkerState
 
 mt5api/
   terminal.py       the only module that imports MetaTrader5; start gate, probe
@@ -159,40 +199,45 @@ mt5api/
   payload.py        one terminal read -> SyncPayload
   builders/         deals -> FX models (ported from Go); position.py carries the ledger
   raw.py            MT5 rows -> plain dataclasses
-  timeutil.py       the epoch floor and the server-clock/UTC tagging rules
+  timeutil.py       the epoch floor, epoch labels and the server-clock/UTC tagging rules
   numbers.py        rounding
   cache.py          price-cache prune
 
 domain/             fx.py (canonical models and SyncPayload), models.py (tables), enums.py
 repositories/       queries and flush, no commits
-services/           transaction boundaries: account, sync (with the scheduler), query; terminal_affinity picks the pin
+services/           transaction boundaries: account, sync (with the scheduler), query;
+                    terminal_affinity picks and stores the pin
 utils/              config, logging
 
-deploy/             open-master, clone, prune-history (Windows); linux/ install, make-master, clone-pool, service, verify-pool
+deploy/             Windows: open-master, clone, prune-history
+deploy/linux/       install, make-master, clone-pool, service, verify-pool, docker-compose
 ```
 
 ## Endpoints
 
 | Method | Path | |
 |---|---|---|
-| POST/GET/PATCH/DELETE | `/accounts`, `/accounts/{id}` | CRUD |
-| POST | `/accounts` | register, then block on the initial sync; 502 if it did not complete |
-| POST | `/accounts/{id}/sync?wait=true` | hard sync, result in the response |
-| POST | `/accounts/{id}/sync?wait=false` | 202, queued at normal priority |
+| POST | `/accounts` | register: pin to a terminal, block on the initial sync; 502 if it did not complete |
+| GET/PATCH/DELETE | `/accounts`, `/accounts/{id}` | list, read, update password or `enabled`, delete with all synced data |
+| POST | `/accounts/{id}/sync?wait=true` | hard sync on the pinned terminal, result in the response; 504 after the wait timeout |
+| POST | `/accounts/{id}/sync?wait=false` | 202, queued at normal priority; `queue_depth` is that terminal's queue |
 | GET | `/accounts/{id}/positions?days=N` | closed positions |
 | GET | `/accounts/{id}/open-positions` | live exposure as of the last sync |
 | GET | `/accounts/{id}/balance-snapshots?days=N` | derived on read |
 | GET | `/accounts/{id}/transactions?days=N` | deposits/withdrawals |
-| GET | `/pool/status` | per-worker state, its own queue depth, accounts pinned to it |
+| GET | `/pool/status` | per worker: state, pid, its queue depth, accounts pinned to it, counters; pool totals |
 | GET | `/healthz` | public liveness: `ok`, `degraded`, `stalled` |
 
 `days=0` means "everything". `/healthz` reports `degraded` when a terminal is
-unusable and `stalled` when the dispatcher has stopped — the second one matters
-because every worker can look perfectly healthy while nothing is being handed
-to them. Every route except `/healthz` takes a single
-bearer token (`MT5_API_API_TOKEN`) in `Authorization: Bearer ...`; leaving the
-setting empty disables auth entirely, which is only acceptable on a closed
-network.
+unusable and `stalled` when a terminal's dispatcher has died — the second one
+matters because every worker can look perfectly healthy while nothing is being
+handed to one of them. Every route except `/healthz` takes a single bearer
+token (`MT5_API_API_TOKEN`) in `Authorization: Bearer ...`; leaving the setting
+empty disables auth entirely, which is only acceptable on a closed network.
+
+An account response carries `terminal` (the pinned path),
+`server_utc_offset_minutes` (the clock in force now, see *Time*), the last
+sync's outcome and the account figures from it.
 
 ## Account status
 
@@ -207,31 +252,51 @@ Why an account is unreachable lives in `last_error`; whether anyone *wants* it
 synced is the separate `enabled` flag. `consecutive_failures` counts failed
 syncs and resets to zero on the first success.
 
-Registration always waits for that sync, and answers **502** with the
+Registration always waits for the initial sync, and answers **502** with the
 account id and the error if it did not complete — an importer that saw 201 would
-tick the account off as done while every read of it returned nothing.
+tick the account off as done while every read of it returned nothing. The
+account row stays, so a 502 can be followed by a hard sync once the cause is
+fixed.
 
 An account flips to `error_connection` when either:
 
 * **three consecutive syncs fail** (`MT5_API_ACCOUNT_ERROR_THRESHOLD`), or
 * **its very first sync fails.** Registering an account queues an *initial*
-  sync ahead of everything else in the pool, with a longer connect timeout
-  (`MT5_API_TERMINAL_INITIAL_CONNECT_TIMEOUT_MS`, 120s) than a routine one.
+  sync ahead of everything else on its terminal, with a longer connect timeout
+  (`MT5_API_TERMINAL_INITIAL_CONNECT_TIMEOUT_MS`, 120 s) than a routine one.
   There is no run of successes for that failure to be a blip in, so one strike
-  is conclusive. `POST /accounts` blocks on it and returns the settled status.
+  is conclusive. Only an attempt that actually ran counts: if the pinned
+  terminal is down, the initial sync waits for it and the request answers 502
+  after `MT5_API_HARD_SYNC_WAIT_TIMEOUT_SECONDS` with the account still
+  `active` and never synced.
 
 The scheduler **skips** `error_connection` accounts. It has to: an account that
 has never synced has `last_synced_at IS NULL`, so it is due on every single
-tick, and one wrong server name would otherwise re-queue itself every 60s and
-occupy every worker for ~100s a time. They come back on an explicit
+tick, and one wrong server name would otherwise re-queue itself every 60 s and
+occupy its terminal for ~100 s a time. They come back on an explicit
 `POST /accounts/{id}/sync`, or as soon as `PATCH /accounts/{id}` supplies a new
 password — new credentials clear the strikes and restore `active`.
+
+Not every `error_connection` is ours to fix. `Authorization failed` (`-6`)
+means the broker refused the credentials; `Invalid account` is the same refusal
+by another name, and on an account that worked yesterday it means the broker
+has locked it after too many logins from new devices. `no deal history
+arrived … yet the account holds …` means the login went through and the broker
+is withholding history, usually for the same reason. Both clear on the
+broker's side with time, not with retries.
 
 ## When the pool goes wrong
 
 A sync pool has a failure mode worse than crashing: staying up and quietly
 doing nothing. Every guard below exists to make that impossible or, failing
 that, visible.
+
+**Workers start four at a time.** Under Wine, importing the worker costs about
+20 s of CPU per process; sixteen of them spawning at once starve each other and
+miss even a 300 s start window, while four at a time all report in. So `start()`
+spawns in batches of four, and the reaper, which runs once a minute, restarts
+every failed worker the same way. Measured on 8 cores, sixteen terminals were up
+in 400–410 s on every restart, none failed.
 
 **A dispatcher outlives its own bugs.** Each terminal has a loop that feeds it
 from its queue; if one died, that terminal's tasks would pile up for ever while
@@ -242,19 +307,25 @@ count can express.
 **A task always ends, and never moves.** Anything thrown while running one is
 caught, the future is resolved, and the worker either becomes ready again or is
 marked failed. A failed worker's queue keeps its tasks and waits: the reaper
-tries a restart once a minute, and the tasks run on that terminal when it is
-back. They are never handed to another terminal — that is the whole point of
-the pin — so a hard sync on a dead terminal times out with 504 while its task
-stays queued. Before, only four exception types were handled; anything else
-removed a terminal from the pool without a word and left the caller waiting out
-its own timeout.
+tries a restart, and the tasks run on that terminal when it is back. They are
+never handed to another terminal — that is the whole point of the pin — so a
+hard sync on a dead terminal times out with 504 while its task stays queued.
 
-**Failing to spawn is a normal outcome**, not an exception - the restart ladder
+**Losing a terminal costs one retry, on the same terminal.** An IPC failure is
+followed by a `terminal_info()` probe; no answer restarts the worker process
+in place and the task is retried on it, spending one of its retries
+(`MT5_API_MAX_TASK_RETRIES`). An initial sync has none and fails instead.
+
+**Failing to spawn is a normal outcome**, not an exception — the restart ladder
 has to keep its footing whether the process would not start or would not
-answer.
+answer, and an exception escaping the spawn marks the worker failed rather than
+leaving it starting forever.
 
-**Nothing writes after shutdown.** In-flight tasks are tracked and awaited by
-`stop()`, so a result can no longer be persisted against a disposed engine.
+**Nothing writes after shutdown.** `stop()` terminates every worker at once,
+and a sync that was in flight at that moment is resolved as "pool is shutting
+down" without touching the account — a service restart is not an account
+failure. Queued tasks are failed the same way; a submit that arrives after the
+pool has closed is answered immediately.
 
 **Threads are sized to the pool.** Every in-flight sync parks one thread in a
 blocking pipe read for its whole duration, up to the task timeout. The default
@@ -344,8 +415,10 @@ than the scan reached, so a year of history converts.
 
 A cold symbol answers the first call with nothing and starts downloading in the
 background, so "not enough bars" means "not yet" rather than "wrong symbol".
-Each candidate is therefore re-read for up to 30s before it is given up on,
-which costs one download instead of five.
+Each candidate is therefore re-read for up to 30 s before it is given up on,
+which costs one download instead of five. A symbol the broker does not list at
+all is skipped at once — `symbol_select` says so, and waiting 30 s for it was
+the single most expensive thing a clock measurement could do.
 
 Only the Friday edge is read. The Sunday one looks like it should say the same
 thing and does not: for the three weeks each March when New York has moved to
@@ -418,17 +491,15 @@ that read them, so the response and a later read agree.
 The clock is measured once per broker per worker process and reused for six
 hours. It changes twice a year, and re-reading it on every sync would mean
 re-downloading the year behind it after each prune. A measurement that *fails*
-is remembered just as long, keyed on the symbols that failed rather than on the
-broker, so an account whose only instrument has no continuous minute history
-pays the candidate walk — five symbols, 30 s each — once per worker process every six hours, not on every sync;
-another account on the same broker with other instruments still gets its own
-attempt. A broker whose clock was ever read keeps that reading through a later
-failed attempt rather than dropping to unknown.
+is remembered just as long, per broker, so a broker whose instruments carry no
+weekend history pays the candidate walk once per worker process every six
+hours, not on every sync. A broker whose clock was ever read keeps that reading
+through a later failed attempt rather than dropping to unknown.
 
 ## What the terminal actually requires
 
-Everything here was found the hard way on Windows; none of it reproduces on a
-Mac, where the package will not even import.
+Everything here was found the hard way on Windows and then again under Wine;
+none of it reproduces on a Mac, where the package will not even import.
 
 **`initialize()` cannot start a terminal without credentials.** A terminal with
 no stored account sits on its *Open an Account* wizard and never answers the IPC
@@ -443,7 +514,7 @@ alike:
 | result | code | took | means |
 |---|---|---|---|
 | `IPC timeout` / `Pipe server didn't answer` | `-1000x` | the full timeout | the terminal never got as far as logging in |
-| `Authorization failed` | `-6` | 1–3s | the server answered and refused the credentials |
+| `Authorization failed` | `-6` | 1–3 s | the server answered and refused the credentials |
 
 A `-6` is conclusive: the terminal resolved the server. A timeout is not — it is
 *usually* a server the terminal has not been configured with, but a cold start
@@ -461,49 +532,35 @@ under load left the pool reporting six healthy idle workers while every sync
 failed in a tenth of a second. But the same `-10005` comes back from a *live*
 terminal asked to log in to a server it does not know, and measured on one:
 `terminal_info()` answers immediately afterwards and the next `login()` lands
-in 0.7s. So every IPC failure is followed by one `terminal_info()` probe. No
-answer retires the worker process, restarts it, and retries the task on the same
-terminal, spending one retry. An answer leaves the terminal alone and the
-failure is the account's. Before the probe,
-one misspelt server name walked through all four workers, reset two terminals
-that had just synced perfectly well, and took eleven minutes to say
-`error_connection`.
+in 0.7 s. So every IPC failure is followed by one `terminal_info()` probe. No
+answer restarts the worker process and retries the task on the same terminal,
+spending one retry. An answer leaves the terminal alone and the failure is the
+account's. Before the probe, one misspelt server name walked through all four
+workers, reset two terminals that had just synced perfectly well, and took
+eleven minutes to say `error_connection`.
 
 A failed cold start behaves the same way: `terminal64.exe` stays up with no
 account, and the next `initialize()` on that path attaches to it in under a
 second rather than starting another.
 
-**A pinned terminal that is down makes its accounts wait, initial syncs
-included.** Registering an account whose terminal is `failed` queues the
-initial sync behind the reaper; if the terminal never comes back the request
-answers 502 after `MT5_API_HARD_SYNC_WAIT_TIMEOUT_SECONDS` with the account
-still `active` and never synced, and the scheduler picks it up once the
-terminal is. Only an attempt that actually ran marks `error_connection`.
-
-**An initial sync gets one attempt.** On the account's terminal, then the
-account is `error_connection` and the caller gets 502 — even when that terminal
-turns out to be dead. Every clone shares the master's server list, so a server
-one cannot reach none can, and a transport failure on the first sync is far
-more often the account than the terminal.
-
-**Timeouts.** 30s for a routine connect, on a terminal that is already up and
-only switching accounts. 120s for the first sync of a newly added account, which
-also has to start the terminal. Cold starts are the expensive case and they get
-more expensive in parallel — several terminals coming up at once on one box
-contend for the same CPU and the same server lookups — so if a whole pool
+**Timeouts.** 30 s for a routine connect, on a terminal that is already up and
+only switching accounts. 120 s for the first sync of a newly added account,
+which also has to start the terminal. Cold starts are the expensive case and
+they get more expensive in parallel — several terminals coming up at once on one
+box contend for the same CPU and the same server lookups — so if a whole pool
 restarting produces timeouts that a single instance does not,
 `MT5_API_TERMINAL_INITIAL_CONNECT_TIMEOUT_MS` is the knob, not a broken server
 list.
 
 Cold starts are staggered through a lock shared by the workers, and nobody
-waits on it for more than 20s after the current start began. That is enough
-for the process to come up — a start on this box takes 2–3s — and short enough
-that a start stuck on a server that never answers does not queue every other
-terminal behind its 120s, which is exactly what it did: one bad server name
-held the lock for two minutes while two terminals that then started in 2s each
-waited behind it. The waiters keep that clock, not the holder: `initialize()`
-holds the GIL for its whole wait, so a timer thread meant to hand the lock on
-early only ran after the call returned.
+waits on it for more than 20 s after the current start began. That is enough
+for the process to come up — a start takes 2–3 s on Windows and a few more
+under Wine — and short enough that a start stuck on a server that never answers
+does not queue every other terminal behind its 120 s, which is exactly what it
+did: one bad server name held the lock for two minutes while two terminals that
+then started in 2 s each waited behind it. The waiters keep that clock, not the
+holder: `initialize()` holds the GIL for its whole wait, so a timer thread meant
+to hand the lock on early only ran after the call returned.
 
 **Dates near the unix epoch.** The package converts datetimes through the
 platform's local-time functions, and Windows probes a day either side to resolve
@@ -517,12 +574,15 @@ exception set`. `mt5api/timeutil.py` therefore floors a full history pull at
 2^31, so `MT5Account.login` is a `BigInteger`.
 
 **History arrives after `login()` does.** On a funded account
-`history_deals_total` reads 0 for the first seconds and then jumps - measured at
+`history_deals_total` reads 0 for the first seconds and then jumps — measured at
 0 on return and 188 two seconds later. A sync reading through that window
 reconstructs an empty account, and the ledger then derives `BalanceInit` from a
 balance with no deals to explain it, so the damage is quietly wrong numbers
-rather than a failure. `fetch.wait_for_history` blocks until the count
-settles, and refuses to believe a zero on an account that holds money.
+rather than a failure. `fetch.wait_for_history` blocks until the count settles,
+refuses to believe a zero on an account that holds money, and treats a read that
+returns nothing at all as the transport error it is rather than as zero deals.
+When the window runs out the worker reads once more with a window four times
+longer, in the same session; only then does the sync fail.
 
 **A naive datetime handed to MT5 is read in *this machine's* timezone.** Every
 datetime the package is given is reduced to a unix epoch and compared straight
@@ -557,13 +617,13 @@ means no MAE/MFE rather than a confident wrong answer.
 market.** Bars are bid; a short is closed by buying at the ask, so its exit
 price sits a spread *above* the bid high it traded in. Four of one account's
 positions had exits 0.2 to 2.1 pips outside their own candles for exactly that
-reason. `apply_fx_mae_mfe` folds the entry and exit into the high and low, so
-`MAE <= Pnl <= MFE` holds by construction rather than by luck - and those four
+reason. The enrichment folds the entry and exit into the high and low, so
+`MAE <= Pnl <= MFE` holds by construction rather than by luck — and those four
 get measured instead of discarded.
 
 What is checked instead is *overlap*: candles that do not straddle the prices a
 position actually dealt at belong to some other period, and are refused. That
-is the case worth catching - one stray bar from years later turned a 0.01 lot
+is the case worth catching — one stray bar from years later turned a 0.01 lot
 EURUSD position into a 161 EUR excursion on a 109 EUR account.
 
 **Some positions can never be measured, and say so.** An account here traded
@@ -574,14 +634,14 @@ carry `MAE = None` rather than a number derived from nothing.
 **How far back MAE/MFE can see is a terminal setting.** `Max bars in chart`
 caps the depth of every timeseries, so at the default 100 000 the minute series
 only reaches ~70 days and no amount of waiting produces 2022 data. The master
-sets it to unlimited. Daily bars are unaffected either way - 100 000 of them is
+sets it to unlimited. Daily bars are unaffected either way — 100 000 of them is
 270 years. `MT5_API_ENRICH_MAE_MFE=false` opts out of the whole business; RR
 needs no candles and keeps working.
 
 **A minute window in the past is never cheap.** The terminal cannot serve an
 isolated old window: it downloads whole years and materialises a contiguous
 series from the requested date to today. One three-hour request in 2022 landed
-83 MB of yearly `.hcc` files plus an 83 MB built `M1.hc` - 170 MB for a single
+83 MB of yearly `.hcc` files plus an 83 MB built `M1.hc` — 170 MB for a single
 symbol on a single instance, and every instance keeps its own copy.
 
 That is why enrichment is **incremental**. A sync still rebuilds the entire
@@ -591,21 +651,23 @@ reads back the ids that already carry a figure and hands them to the worker,
 which prices only the rest. Without it every sync would ask for candles from
 years ago and the deep cache could never be reclaimed. The flip side: a skipped
 position arrives carrying no MAE/MFE, so `PositionRepository` treats an absent
-value as "not recalculated" rather than "cleared" - otherwise the second sync's
+value as "not recalculated" rather than "cleared" — otherwise the second sync's
 upsert would wipe what the first one measured.
 
-With that in place the cache is disposable, and `deploy/prune-history.ps1`
-disposes of it. Deleting is safe while the pool runs: Windows refuses the few
-files a terminal holds open and the script skips them, the terminal keeps
-serving from memory meanwhile, and anything still needed comes back on demand
-in about 30s. Measured across three instances after a backfill: 2.8 GB down to
-0.6 GB.
+With that in place the cache is disposable. Each worker drops its own
+instance's price history after every sync it finishes
+(`MT5_API_PRUNE_CACHE_AFTER_SYNC`, on by default); nothing is kept, and what a
+later sync genuinely needs comes back on demand. Measured across four
+instances, this held the pool at ~250 MB where it had reached 4.3 GB
+unattended. `deploy/prune-history.ps1` covers the cases the service cannot
+reach on Windows: an instance the pool is not syncing through, a one-off
+reclaim with the pool stopped, or a dry run without `-Apply`.
 
 **Stripping the terminal down does not stay stripped.** `MetaEditor64.exe` and
 `metatester64.exe` are not needed to sync, but LiveUpdate pulls them back the
 first time an instance is used, so the master ships them rather than have every
 clone re-download 133 MB. Removing the `Sounds` wavs and the MQL5 sample
-sources does stick, and the samples are worth removing - the terminal
+sources does stick, and the samples are worth removing — the terminal
 recompiles them on a fresh start.
 
 **uvicorn hands itself the wrong event loop.** psycopg refuses to run its async
@@ -615,19 +677,152 @@ server on a `SelectorEventLoop` instead.
 
 ## Deploying
 
-Needs a **Windows environment** — `MetaTrader5` is a Windows-only wheel, and so
-is everything the terminal does. That environment can be Windows itself, or
-Wine on Linux; the code is identical either way, and the Linux route is written
-up in *Deploying on Linux* below. The repository only carries the service; the
-four things below live outside it and have to exist on the box before the
-service is any use.
+The service needs a **Windows environment**: `MetaTrader5` is a Windows-only
+wheel, and so is everything the terminal does. That environment is either
+Windows itself or Wine on Linux. The code is identical; only the scripts differ.
+The repository carries the service and the scripts; the master terminal and the
+database live outside it.
 
-### 1. Machine
+### Linux, under Wine — the production route
+
+`MetaTrader5` is imported in exactly one place, `mt5api/terminal.py`, so rather
+than splitting the service in two and bridging it over RPC, the whole process
+runs inside a single Wine prefix: the API, the scheduler and every worker.
+Process spawning and the worker pipes behave under Wine as they do on Windows.
+Postgres stays a native Linux service, or a container: it has no business inside
+the emulation, and keeping it out means it does not compete for the one resource
+that runs short.
+
+Everything lives under one directory, `/opt/mt5` by default:
+
+```
+/opt/mt5/
+  wine/               the Wine prefix: C:\Python312, C:\app (the code), C:\MT5\master + t1..tN
+  src/                a copy of the repository the scripts run from
+  bin/mt5api-run.sh   what systemd actually executes
+  logs/mt5api.log     the service log, one JSON event per line
+  secrets/db.env      the database password and the API token
+  artefacts/          the master terminal as a tarball
+```
+
+From a bare Ubuntu 24.04 box:
+
+```bash
+sudo bash deploy/linux/install.sh          # WineHQ, Xvfb, Windows Python 3.12 in the prefix, the code, pip deps
+docker compose -f deploy/linux/docker-compose.yml up -d    # or apt install postgresql; either way max_connections=200
+tar xzf master-6182.tgz -C /opt/mt5/wine/drive_c/MT5        # a current, portable, credential-free master
+bash deploy/linux/clone-pool.sh 16                          # master -> t1..t16, prints MT5_API_TERMINAL_PATHS
+# write /opt/mt5/wine/drive_c/app/.env from .env.example
+sudo bash deploy/linux/service.sh install                   # xvfb.service + mt5api.service, waits for pool.started
+python3 deploy/linux/verify-pool.py --token "$MT5_API_API_TOKEN" --parallel 16
+```
+
+`install.sh` is idempotent. Four things about it are not obvious, and each of
+them fails silently:
+
+| | |
+|---|---|
+| `WINEDLLOVERRIDES="mscoree,mshtml="` | without it `wineboot` blocks forever on the Mono/Gecko dialog, which nothing can answer on a headless box. This is the usual reason a Wine setup looks hung |
+| a virtual display | the terminals will not start without one, so `xvfb.service` exists and `mt5api.service` requires it. `install.sh` starts a temporary one for its own use and stops it on exit — a leftover would keep the unit from binding the display |
+| the interpreter is a *Windows* Python inside the prefix | a Linux `python3` cannot load the `MetaTrader5` wheel however much Wine is installed |
+| the launch command lives in `/opt/mt5/bin/mt5api-run.sh` | systemd strips backslashes out of `ExecStart`, mangling every Windows path handed to it |
+
+**The master is the deployment artefact, and it has to be on the current
+build.** A terminal from an older package downloads its update on the first
+login — about 190 MB — and that download starves the deal-history fetch, so that
+first sync fails with "no deal history arrived" while reporting the balance
+perfectly correctly; every clone repeats it. A terminal that has been in service
+has already applied the update and accumulated the broker list.
+`make-master.sh` promotes one to master and strips what must not travel with it
+— above all `Config/accounts.dat`, which holds the credentials of every account
+that terminal ever logged into. `clone-pool.sh` refuses to clone a master that
+still carries that file.
+
+```bash
+systemctl stop mt5api
+bash deploy/linux/make-master.sh t1
+tar czf /opt/mt5/artefacts/master-$(date +%Y%m%d).tgz -C /opt/mt5/wine/drive_c/MT5 master
+```
+
+Do not let Wine try to install MT5 for you: `mt5setup.exe /auto` under Wine
+installs nothing and says nothing.
+
+**Settings that are Linux-specific.** Importing the worker under Wine costs
+~20 s of CPU per process, so `MT5_API_WORKER_START_TIMEOUT_SECONDS=300`;
+workers are spawned four at a time and the reaper restarts failures the same
+way, which put sixteen terminals up in 400–410 s on every restart measured. A
+service restart therefore leaves the pool short for about seven minutes;
+queued syncs wait rather than fail.
+
+**Pool size.** Measured with one storm over the same 63 accounts on a 6-core
+box:
+
+| pool | storm | median sync | memory | free |
+|---|---|---|---|---|
+| 6 | 218 s | 46.2 s | 3.9 GB | 8.1 GB |
+| 12 | 157 s | 33.2 s | 5.7 GB | 6.3 GB |
+| 18 | 168 s | 31.9 s | 7.4 GB | 4.6 GB |
+| 24 | 167 s | 32.6 s | 9.3 GB | 0.9 GB |
+
+Everything is won going from 6 to 12; 18 and 24 are flat. Extra terminals pay
+only while they fill the gaps where one waits on a broker, and once those are
+full the work is back to sharing the cores. About two terminals per core is the
+ceiling; the production box runs 16 on 8 cores. Twenty-four also left under a
+gigabyte free with no swap configured, so the first unusual burst would take the
+service down rather than slow it. The same work costs roughly twice the CPU it
+does on Windows — 72% of the time in the kernel, one terminal peaking at three
+cores — because every Windows system call is translated; compare the price per
+hundred accounts served, not the price of the box.
+
+**What a full run looks like.** The 99-account test list on the 16-terminal
+box, registered eight at a time: 51 active, 33 rejected by their brokers (the
+same credentials fail on Windows), 14 with history withheld (accounts that had
+been logged in repeatedly that day), one timeout. 108 syncs, median 14.5 s, p90
+62 s, max 205 s; the accounts spread over the terminals two to five each. On
+the earlier 6-core box: 63 of 100 active, zero failures across hard-sync storms
+of 20 and 50 concurrent, a background cycle of 6.3 s per account.
+
+**Testing a pool, and what not to test it with.** Use accounts that have not
+been logging in all day, and never the same handful from a string of fresh
+terminals. A cold pool checked with the same five accounts a dozen times over
+one morning ended with every one of them failing "no deal history arrived" at
+30 s, 90 s and 150 s alike and three of them locked (`Invalid account`) — while
+five other valid accounts, untouched that day, synced first time through the
+very same terminals with history in 3–5 s. Repeated logins from new terminal
+identities make brokers withhold history and then refuse the login; that is the
+test, not the pool, and it takes days to clear. `verify-pool.py` runs two rounds
+of hard syncs over every active account and exits non-zero if the last one still
+fails, so it can gate a deploy.
+
+**Operating it.**
+
+```bash
+systemctl status mt5api xvfb            # or: bash deploy/linux/service.sh status
+tail -f /opt/mt5/logs/mt5api.log        # or: bash deploy/linux/service.sh logs
+systemctl restart mt5api                # ~7 min until every terminal is back
+```
+
+Changing the pool size is editing `MT5_API_TERMINAL_PATHS` in
+`/opt/mt5/wine/drive_c/app/.env` — after `clone-pool.sh N` for new clones — and
+restarting. Removing a path re-pins its accounts elsewhere on their next sync;
+adding one leaves it empty until new accounts are registered. Deploying new
+code is copying the repository over `/opt/mt5/wine/drive_c/app` (never `.env`)
+and restarting; `install.sh` does exactly that, and nothing else, on a box that
+is already set up.
+
+Terminal logs are UTF-16 at `/opt/mt5/wine/drive_c/MT5/tN/logs/*.log`; pipe
+them through `iconv -f UTF-16LE -t UTF-8`. Stop the service with `systemctl`,
+not by killing processes: a `wineserver` killed with `-9` leaves the next start
+rebooting Wine's own services for a minute before the workers can spawn.
+
+### Windows
+
+The same four things have to exist on the box.
 
 * **Python 3.12, 64-bit.** The `MetaTrader5` wheel is CPython-specific and
   64-bit only, to match `terminal64.exe`.
-* **PostgreSQL.** Any recent version. Create the role and database the
-  connection string expects:
+* **PostgreSQL.** Any recent version, `max_connections` of at least 200. Create
+  the role and database the connection string expects:
 
   ```sql
   CREATE ROLE mt5_api LOGIN PASSWORD '...';
@@ -639,65 +834,52 @@ service is any use.
   no migrations beyond that, so a change to an existing column's type or an
   enum needs the database dropped rather than altered.
 
-### 2. The master terminal
+* **The master terminal.** Install MetaTrader 5 once, anywhere, then keep one
+  cleaned copy as the master — say `D:\MT5\master`. Every instance is a
+  *portable* install: its data lives beside `terminal64.exe` rather than in
+  `%APPDATA%\MetaQuotes`, which is what makes a clone a directory copy and keeps
+  instances from sharing state. Open it with `deploy\open-master.cmd`, which
+  passes `/portable`; opening it any other way sends it to `%APPDATA%`.
 
-Install MetaTrader 5 once, anywhere, then keep one cleaned copy as the master —
-say `D:\MT5\master`. Every instance is a *portable* install: its data lives
-beside `terminal64.exe` rather than in `%APPDATA%\MetaQuotes`, which is what
-makes a clone a directory copy and keeps instances from sharing state.
+  Brokers do **not** have to be added to the master. The terminal looks a
+  server up by name through MetaQuotes' directory on the first login: measured
+  on a 99-account list spanning 51 servers, none of which the master had seen,
+  50 resolved on the first try. *File → Open an Account* in the master is only
+  worth doing for a server the directory does not list — and then close the
+  terminal fully before cloning, since `Config\servers.dat` is written on exit.
 
-Open it with `deploy\open-master.cmd`, which passes `/portable`. Opening it any
-other way sends it to `%APPDATA%\MetaQuotes`, and the brokers added there will
-never reach the clones.
+  Keep the master on the current build, for the reason given under Linux. The
+  master also carries the settings every clone inherits:
 
-Brokers do **not** have to be added to the master. The terminal looks a server
-up by name through MetaQuotes' directory on the first login: measured on a
-99-account list spanning 51 servers, none of which the master had seen, 50
-resolved on the first try and the one that did not (`HFMarketsGlobal-Live3`)
-timed out the same way a misspelt name does. *File → Open an Account* in the
-master is only worth doing for a server the directory does not list — and then
-close the terminal fully before cloning, since `Config\servers.dat` is written
-on exit.
+  | setting | why |
+  |---|---|
+  | *Max bars in chart*: unlimited | without it MAE/MFE cannot see past ~70 days |
+  | News, sounds, notifications off | nothing in a sync needs them |
+  | No chart profiles | an open chart renders ticks for no reason |
+  | `Config\assistant.ini`: both MCP listeners `Enable=0` | they bind fixed ports 22345 and 22346, so the second instance would collide |
 
-Keep the master on the current build. Every clone otherwise downloads the
-update itself on first start (370 MB into `%APPDATA%\MetaQuotes`, portable or
-not) and applies it on the next; opening the master, letting it download, and
-opening it once more takes two minutes and every clone then starts current.
+* **The pool and the service.**
 
-The master also carries the settings every clone inherits, which are worth
-checking after any manual session with it:
+  ```powershell
+  deploy\clone.ps1 -Count 6 -Root D:\MT5     # with every terminal closed; -Force rebuilds
+  pip install -r requirements.txt
+  copy .env.example .env                     # then edit it
+  python main.py
+  ```
 
-| setting | why |
-|---|---|
-| *Max bars in chart*: unlimited | without it MAE/MFE cannot see past ~70 days |
-| News, sounds, notifications off | nothing in a sync needs them |
-| No chart profiles | an open chart renders ticks for no reason |
-| `Config\assistant.ini`: both MCP listeners `Enable=0` | they bind fixed ports 22345 and 22346, so the second instance would collide |
+  `-Root` is optional on every script in `deploy\`: left out, it is read back
+  from `MT5_API_TERMINAL_PATHS` in `.env`, falling back to `D:\MT5`, which is
+  what lets `open-master.cmd` work on a double-click.
 
-### 3. The pool
+  One Windows-only trap: a terminal launched by Task Scheduler or as a service
+  runs in session 0, authorizes, syncs symbols, and never downloads deal
+  history. Launch the service from an interactive session or as a child of
+  `sshd`, not as a service.
 
-```powershell
-deploy\clone.ps1 -Count 6 -Root D:\MT5
-```
+### Settings
 
-Run it with every terminal closed. It copies the master N times, strips the
-per-instance caches, and prints the `MT5_API_TERMINAL_PATHS` line to paste into
-`.env`. `-Force` rebuilds clones that already exist.
-
-`-Root` is optional on every script in `deploy\`. Left out, it is read back from
-`MT5_API_TERMINAL_PATHS` in `.env` — the clones are listed there and the master
-sits beside them — falling back to `D:\MT5`. That is what makes
-`open-master.cmd` work on a double-click, which passes no arguments at all.
-
-### 4. The service
-
-```powershell
-pip install -r requirements.txt
-copy .env.example .env      # then edit it
-python main.py
-```
-
-The settings that decide whether it works at all:
+`.env.example` documents every setting. The ones that decide whether it works
+at all:
 
 | setting | note |
 |---|---|
@@ -705,31 +887,26 @@ The settings that decide whether it works at all:
 | `MT5_API_TERMINAL_PORTABLE` | must match how the instances were installed; a mismatch sends the terminals to a data directory with no accounts in it |
 | `MT5_API_DATABASE_URL` | |
 | `MT5_API_API_TOKEN` | leaving it empty disables auth on every route but `/healthz` |
+| `MT5_API_WORKER_START_TIMEOUT_SECONDS` | 300 under Wine |
+| `MT5_API_SYNC_INTERVAL_MINUTES` | how stale an account may get before the scheduler re-queues it; 15 in production |
 | `MT5_API_PRUNE_CACHE_AFTER_SYNC` | on by default; without it the price cache grows without bound |
 
 Startup logs an `app.startup.config` warning for each terminal path that is not
 there, an empty pool, and a missing token. Then check `GET /healthz` and
-`GET /pool/status`: one worker per path, all healthy.
+`GET /pool/status`: one worker per path, all idle.
 
-### 5. Housekeeping
+**Database connections.** A request holds a pooled connection only while it
+reads or writes; a hard sync and an account registration give theirs back
+before they wait on the pool. `MT5_API_DB_POOL_SIZE` (30) and
+`MT5_API_DB_MAX_OVERFLOW` (50) size the pool — 80 in total, enough for fifty
+hard syncs arriving at once with room to spare. Postgres itself defaults to 100
+connections; the compose files raise it to 200, and a production database must
+allow at least the pool's 80 plus everything else that connects. Before the
+wait was taken out of the session, sixteen callers waiting on hard syncs used up
+a 15-connection pool and the worker that had to write the result got none: the
+sync ran, the caller got 200 with the data, and the database never saw it.
 
-The price cache prunes itself. Each worker drops its own instance's price
-history after every sync it finishes — `MT5_API_PRUNE_CACHE_AFTER_SYNC`, on by
-default. Nothing is kept: what a later sync genuinely needs it fetches again,
-and that is little, because MAE/MFE is measured once per position and the clock
-is held in memory between syncs. Measured across four instances, this held the
-pool at ~250 MB where it had reached 4.3 GB unattended.
-
-It runs after the result is on its way, so a hard sync never waits for it, and
-a failure is logged rather than failing the task. Files the terminal holds open
-are skipped by Windows and go on the next run.
-
-`deploy\prune-history.ps1` is what is left for the cases the service cannot
-reach: an instance the pool is not currently syncing through, a one-off reclaim
-with the pool stopped, or a dry run — without `-Apply` — to see the size
-first.
-
-### What it costs
+### What it costs on Windows
 
 Measured in a load test on one box (12 cores, 15 GB, four terminals, 99 real
 accounts of which 66 had valid credentials):
@@ -744,125 +921,10 @@ accounts of which 66 had valid credentials):
 | background cycle, 64 accounts | 4 min 19 s — 4.0 s per account across the pool |
 | disk, per instance | 270 MB, plus the price cache the prune keeps in check |
 
-At 4 s per account, a four-terminal pool re-syncs about **220 accounts inside a
-15-minute interval** and about 890 inside an hour, once their history has been
-priced. Two things eat into that: a new account costs 10–70 s of a worker on top,
-and an account whose server never answers costs one 120 s. Neither disturbed
-the rest of the pool in the test — no worker restarts, no terminals reset.
-
-A cold terminal start is two to three seconds once the process is up, and
-starts are staggered across the pool, so a pool has every terminal up within a
-minute of tasks arriving — a terminal cannot start before a task supplies
-credentials.
-
-**Database connections.** A request holds a pooled connection only while it
-reads or writes; a hard sync and an account registration give theirs back
-before they wait on the pool. `MT5_API_DB_POOL_SIZE` (30) and
-`MT5_API_DB_MAX_OVERFLOW` (50) size the pool — 80 in total, enough for fifty
-hard syncs arriving at once with room to spare. Postgres itself defaults to
-100 connections; the dev compose file raises it to 200, and a production
-database must allow at least the pool's 80 plus everything else that connects. Before the wait was taken out of the session, sixteen
-callers waiting on hard syncs used up a 15-connection pool and the worker that
-had to write the result got none: the sync ran, the caller got 200 with the
-data, and the database never saw it.
-
-## Deploying on Linux
-
-The service runs on Linux unchanged. `MetaTrader5` is imported in exactly one
-place — `mt5api/terminal.py` — so rather than splitting the service in two and
-bridging it over RPC, the whole process runs inside a single Wine prefix:
-the API, the scheduler and every worker. Process spawning and the worker pipes
-behave under Wine as they do on Windows, so the pool needs no changes at all.
-
-Postgres stays a native Linux service, or a container. It has no business
-inside the emulation, and keeping it out means it does not compete for the one
-resource that actually runs short.
-
-Measured on Ubuntu 24.04, 6 cores, 11 GB, against 100 real accounts: 63 active,
-zero failures across sync storms of 20 and 50 concurrent, a background cycle of
-6.3 s per account. The same work costs roughly twice the CPU it does on
-Windows — 72% of the time was spent in the kernel, one terminal peaking at
-three cores — because every Windows system call is being translated. Compare
-the price per hundred accounts served, not the price of the box.
-
-```bash
-sudo bash deploy/linux/install.sh          # Wine, Xvfb, Windows Python, deps
-docker compose -f deploy/linux/docker-compose.yml up -d    # or the distro's postgres
-# put a current portable master at /opt/mt5/wine/drive_c/MT5/master
-bash deploy/linux/clone-pool.sh 12
-# write /opt/mt5/wine/drive_c/app/.env  (paths look like C:\MT5\t1\terminal64.exe)
-sudo bash deploy/linux/service.sh install
-python3 deploy/linux/verify-pool.py --token "$TOKEN" --parallel 12
-```
-
-The master is the deployment artefact, and it has to be on the current build.
-A terminal from an older package downloads its update on the first login —
-about 190 MB — and that download starves the deal-history fetch, so that first
-sync fails with "no deal history arrived" while reporting the balance
-perfectly correctly. Every clone repeats it, and on a bare box there are no
-accounts yet to warm the pool with, so this cannot be fixed after the fact.
-
-A terminal that has been in service has already solved both halves: it applied
-the update on its next start, and it accumulated the broker list.
-`make-master.sh` promotes one to master and strips what must not travel with
-it — above all `Config/accounts.dat`, which holds the credentials of every
-account that terminal ever logged into:
-
-```bash
-systemctl stop mt5api
-bash deploy/linux/make-master.sh t1
-```
-
-Measured: a pool cloned from a current master starts on build 6182 and pulls
-no update on login. `clone-pool.sh` refuses to clone a master that still
-carries credentials.
-
-One thing to know when testing a fresh pool: use accounts you have not been
-logging in all day. A cold pool was checked with the same five accounts a dozen
-times over one morning, each time from a freshly cloned terminal, and by the
-end every one of them failed "no deal history arrived" at 30 s, at 90 s and at
-150 s — while five other valid accounts, untouched that day, synced first time
-through the very same terminals with history in 3–5 s. Repeated logins from a
-string of new terminal identities make brokers withhold history; that is the
-test, not the pool. The worker still retries such a sync once, with a longer
-settle window, which covers the genuine slow cases.
-
-Four things about this are not obvious, and each of them fails silently:
-
-| | |
-|---|---|
-| `WINEDLLOVERRIDES="mscoree,mshtml="` | without it `wineboot` blocks forever on the Mono/Gecko dialog, which nothing can answer on a headless box. This is the usual reason a Wine setup looks hung |
-| a virtual display | the terminals will not start without one, so `xvfb.service` exists and `mt5api.service` requires it |
-| the interpreter is a *Windows* Python inside the prefix | a Linux `python3` cannot load the `MetaTrader5` wheel however much Wine is installed |
-| the launch command lives in `/opt/mt5/bin/mt5api-run.sh` | systemd strips backslashes out of `ExecStart`, mangling every Windows path handed to it |
-
-Pool size was measured rather than guessed, with one storm over the same 63
-accounts:
-
-| pool | storm | median sync | memory | free |
-|---|---|---|---|---|
-| 6 | 218 s | 46.2 s | 3.9 GB | 8.1 GB |
-| 12 | 157 s | 33.2 s | 5.7 GB | 6.3 GB |
-| 18 | 168 s | 31.9 s | 7.4 GB | 4.6 GB |
-| 24 | 167 s | 32.6 s | 9.3 GB | 0.9 GB |
-
-Everything is won going from 6 to 12; 18 and 24 are flat. Extra terminals pay
-only while they fill the gaps where one waits on a broker, and once those are
-full the work is back to sharing six cores. Roughly two terminals per core is
-the ceiling. Twenty-four also leaves under a gigabyte free with no swap
-configured, so the first unusual burst takes the service down rather than
-slowing it.
-
-`verify-pool.py` runs two rounds of hard syncs over every active account and
-exits non-zero if the last one still fails, so it can gate a deploy.
-
-Two Linux-specific settings worth raising in `.env`: importing the worker under
-Wine costs ~20 s per process, so twelve workers spawning at once do not all
-report within the default 120 s start window; set
-`MT5_API_WORKER_START_TIMEOUT_SECONDS=300`. Workers are spawned four at a time
-for the same reason, and the reaper restarts whatever failed the same way once
-a minute; measured on 8 cores, sixteen terminals were all up in under seven
-minutes.
+At 4 s per account, a four-terminal pool re-syncs about 220 accounts inside a
+15-minute interval, once their history has been priced. A new account costs
+10–70 s of its worker on top, and an account whose server never answers costs
+one 120 s.
 
 ## Verifying
 
@@ -875,12 +937,16 @@ is the reconstruction itself, which needs an account with real trading history:
 2. For MAE/MFE, open the chart over a position's lifetime and check the high and
    low match. A symbol the account has not traded recently may need selecting in
    Market Watch before its history is available.
-3. Queue a bulk sync of 20+ accounts and watch `/pool/status`: every worker
+3. Register a few accounts and check `terminal` in each response: they land on
+   distinct terminals, and three hard syncs of one account all come back with
+   the same `worker_id`, the one whose `terminal_path` is that account's pin.
+4. Queue a bulk sync of 20+ accounts and watch `/pool/status`: every worker
    busy, each terminal's queue draining, and a hard sync fired mid-way coming
    back first on its own terminal.
-4. Kill one `terminal64.exe` mid-sync — the service should restart that worker
-   and finish the task on it, never on another.
-5. Check the clock: `GET /accounts/{id}` should report a
+5. Kill one `terminal64.exe` mid-sync — the service should restart that worker
+   and finish the task on it, never on another; `restarts` on that worker goes
+   up by one and no other worker's counters move.
+6. Check the clock: `GET /accounts/{id}` should report a
    `server_utc_offset_minutes` that matches the terminal's own Market Watch
    time. Inside the trading week that comes off a live quote; at the weekend it
    falls back to the weekend scan, so either is a fair time to look. Then check
