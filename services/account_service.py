@@ -48,6 +48,7 @@ class AccountService:
             account.status = AccountStatus.active
             account.consecutive_failures = 0
             account.last_error = None
+            account.history_withheld_until = None
         if enabled is not None:
             account.enabled = enabled
         updated = await self.repo.update(account)

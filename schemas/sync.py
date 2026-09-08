@@ -16,6 +16,7 @@ class SyncQueuedResponse(BaseModel):
 class SyncResultResponse(BaseModel):
     account_id: str
     ok: bool
+    history_withheld: bool = False
     error: Optional[str] = None
     duration_ms: int = 0
     worker_id: Optional[str] = None

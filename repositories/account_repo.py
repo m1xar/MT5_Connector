@@ -46,10 +46,12 @@ class AccountRepository:
         return list(result.scalars().all())
 
     async def due_for_sync(self, interval_minutes: int) -> list[MT5Account]:
-        threshold = datetime.now(timezone.utc) - timedelta(minutes=interval_minutes)
+        now = datetime.now(timezone.utc)
+        threshold = now - timedelta(minutes=interval_minutes)
         statement = (
             _active(select(MT5Account))
             .where(MT5Account.last_synced_at.is_(None) | (MT5Account.last_synced_at < threshold))
+            .where(MT5Account.history_withheld_until.is_(None) | (MT5Account.history_withheld_until <= now))
             .order_by(MT5Account.last_synced_at.asc().nullsfirst())
             .limit(_DUE_BATCH)
         )
@@ -92,6 +94,31 @@ class AccountRepository:
         account.consecutive_failures = 0
         account.last_error = None
         account.last_synced_at = utc_now()
+        account.history_withheld_until = None
+        return await self.update(account)
+
+    async def mark_withheld(
+        self,
+        account: MT5Account,
+        *,
+        balance: float,
+        equity: float,
+        leverage: int,
+        currency: str,
+        server_clock: list | None = None,
+        pause_minutes: int,
+    ) -> MT5Account:
+        account.balance = balance
+        account.equity = equity
+        account.leverage = leverage
+        account.currency = currency
+        if server_clock:
+            account.server_clock = server_clock
+        account.status = AccountStatus.active
+        account.consecutive_failures = 0
+        account.last_error = None
+        account.last_synced_at = utc_now()
+        account.history_withheld_until = utc_now() + timedelta(minutes=pause_minutes)
         return await self.update(account)
 
     async def mark_error(self, account: MT5Account, error: str, *, initial: bool, threshold: int) -> MT5Account:

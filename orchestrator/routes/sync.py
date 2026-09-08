@@ -24,7 +24,13 @@ router = APIRouter(tags=["Sync"], responses=COMMON_RESPONSES, dependencies=[Depe
         "With `wait=true` (a hard sync) the account jumps to the front of the "
         "terminal queue and the freshly pulled data comes back in the response, "
         "already written to the database. With `wait=false` the sync is queued at "
-        "normal priority and 202 comes back immediately."
+        "normal priority and 202 comes back immediately.\n\n"
+        "`history_withheld: true` means the login went through but the broker "
+        "returned no deal history for an account that plainly has some - the "
+        "usual cause is a master password while the owner's own terminal is "
+        "connected. Figures and open positions are updated, closed positions "
+        "and transactions are left as they were, and the scheduler leaves the "
+        "account alone for an hour. PATCH the account with the investor password."
     ),
     responses={**COMMON_RESPONSES, 504: {"description": "Hard sync exceeded its wait timeout"}},
 )
@@ -60,6 +66,7 @@ async def sync_account(
     return SyncResultResponse(
         account_id=result.account_id,
         ok=result.ok,
+        history_withheld=result.history_withheld,
         error=result.error,
         duration_ms=result.duration_ms,
         worker_id=result.worker_id,

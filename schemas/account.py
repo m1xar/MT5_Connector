@@ -11,7 +11,7 @@ from mt5api.clock import ServerClock
 
 class AccountCreateRequest(BaseModel):
     login: int = Field(description="MT5 account number")
-    password: str = Field(description="MT5 password (investor or master)")
+    password: str = Field(description="MT5 password - the investor password, unless the account has no other")
     server: str = Field(description="Broker server name exactly as the terminal lists it")
 
 
@@ -35,6 +35,7 @@ class AccountResponse(BaseModel):
     currency: str
     last_synced_at: Optional[str]
     last_error: Optional[str]
+    history_withheld_until: Optional[str]
     created_at: Optional[str]
 
 
@@ -59,5 +60,6 @@ def account_to_response(account: MT5Account) -> AccountResponse:
         currency=account.currency,
         last_synced_at=account.last_synced_at.isoformat() if account.last_synced_at else None,
         last_error=account.last_error,
+        history_withheld_until=account.history_withheld_until.isoformat() if account.history_withheld_until else None,
         created_at=account.created_at.isoformat() if account.created_at else None,
     )

@@ -83,11 +83,6 @@ reaper brings it back (see *When the pool goes wrong*). Two registrations that
 land at the same instant can read the same counts and pick the same terminal;
 later picks rebalance, nothing corrects it retroactively.
 
-The retry inside a sync respects the pin too. When the login succeeded but no
-deal history arrived inside the settle window, the worker reads again with a
-window four times longer — in the same session, without logging in again, so
-a retry costs the broker nothing.
-
 ## Data model
 
 Canonical models live in `domain/fx.py` and mirror the Go structs field for
@@ -188,7 +183,7 @@ orchestrator/
 pool/
   manager.py        one priority queue and one dispatcher per terminal; batched spawn; the reaper
   worker_handle.py  one worker process: spawn, pipe, restart ladder, its queue and counters
-  worker.py         runs inside the child; one terminal, one task at a time, the history retry
+  worker.py         runs inside the child; one terminal, one task at a time
   protocol.py       what crosses the pipe: SyncTask, SyncResult, WorkerState
 
 mt5api/
@@ -217,7 +212,7 @@ deploy/linux/       install, make-master, clone-pool, service, verify-pool, dock
 
 | Method | Path | |
 |---|---|---|
-| POST | `/accounts` | register: pin to a terminal, block on the initial sync; 502 if it did not complete |
+| POST | `/accounts` | register: pin to a terminal, block on the initial sync; 422 if the broker withheld the history, 502 if the sync did not complete |
 | GET/PATCH/DELETE | `/accounts`, `/accounts/{id}` | list, read, update password or `enabled`, delete with all synced data |
 | POST | `/accounts/{id}/sync?wait=true` | hard sync on the pinned terminal, result in the response; 504 after the wait timeout |
 | POST | `/accounts/{id}/sync?wait=false` | 202, queued at normal priority; `queue_depth` is that terminal's queue |
@@ -250,7 +245,11 @@ Two states, and they answer one question only — can the pool reach this accoun
 
 Why an account is unreachable lives in `last_error`; whether anyone *wants* it
 synced is the separate `enabled` flag. `consecutive_failures` counts failed
-syncs and resets to zero on the first success.
+syncs and resets to zero on the first success. Beside the status there is one
+pause, `history_withheld_until`: set when the broker let the login in but kept
+the deal history back (see *Passwords*), and while it is in the future the
+scheduler does not touch the account at all. A hard sync ignores it, and any
+sync that brings history clears it.
 
 Registration always waits for the initial sync, and answers **502** with the
 account id and the error if it did not complete — an importer that saw 201 would
@@ -280,10 +279,44 @@ password — new credentials clear the strikes and restore `active`.
 Not every `error_connection` is ours to fix. `Authorization failed` (`-6`)
 means the broker refused the credentials; `Invalid account` is the same refusal
 by another name, and on an account that worked yesterday it means the broker
-has locked it after too many logins from new devices. `no deal history
-arrived … yet the account holds …` means the login went through and the broker
-is withholding history, usually for the same reason. Both clear on the
+has locked it after too many logins from new devices. Both clear on the
 broker's side with time, not with retries.
+
+## Passwords
+
+Register accounts with the **investor password**. The master password is a
+fallback for an account that has no other, and it is the user's own risk.
+
+The reason is not access — both log in, and both return the balance — but
+what a broker does with a second session. Measured on FTMO, with the owner's
+own terminal connected: four master-password sessions over 35 minutes never
+received a single deal, while the investor password on the same terminal and
+the same IP had the full history 18 s after login. Every commercial connector
+asks for the investor password for the same reason. The terminal's journal
+says which one it was given: `trading has been enabled` is the master
+password, `trading has been disabled - investor mode` the investor one.
+
+So the service tells *withheld* from *empty*. A read with no deals is withheld
+when the account has open positions, or a balance that is not a round multiple
+of ten, or an equity that differs from the balance — money that has to have
+come from somewhere. No deals on a round balance with nothing open is a new
+account, and syncs as one. Then:
+
+* **Registration** with withheld history is refused: the row is not kept and
+  `POST /accounts` answers **422** `history_withheld` — register again with
+  the investor password.
+* **A working account** whose history is withheld on a later sync is not in
+  error. Its figures and open positions are updated, its closed positions and
+  transactions are left exactly as they were, and `history_withheld_until` is
+  set an hour ahead (`MT5_API_HISTORY_WITHHELD_PAUSE_MINUTES`). The scheduler
+  skips it until then; a hard sync runs regardless and reports
+  `history_withheld: true`.
+* `PATCH /accounts/{id}` with a new password lifts the pause along with the
+  strikes, which is how an account is moved from its master password to its
+  investor one.
+
+A withheld read never counts as a failed sync: `consecutive_failures` and
+`error_connection` are for connections that did not happen.
 
 ## When the pool goes wrong
 
@@ -578,11 +611,12 @@ exception set`. `mt5api/timeutil.py` therefore floors a full history pull at
 0 on return and 188 two seconds later. A sync reading through that window
 reconstructs an empty account, and the ledger then derives `BalanceInit` from a
 balance with no deals to explain it, so the damage is quietly wrong numbers
-rather than a failure. `fetch.wait_for_history` blocks until the count settles,
-refuses to believe a zero on an account that holds money, and treats a read that
-returns nothing at all as the transport error it is rather than as zero deals.
-When the window runs out the worker reads once more with a window four times
-longer, in the same session; only then does the sync fail.
+rather than a failure. `fetch.wait_for_history` polls the count once a second
+for up to `MT5_API_HISTORY_SETTLE_TIMEOUT_SECONDS` (10) and returns as soon as
+it reads the same non-zero total twice; a read that returns nothing at all is
+the transport error it is rather than zero deals. A count still at zero when
+the window runs out is not an error either — what came back is read and
+classified, see *Passwords*.
 
 **A naive datetime handed to MT5 is read in *this machine's* timezone.** Every
 datetime the package is given is reduced to a unix epoch and compared straight
@@ -729,9 +763,8 @@ them fails silently:
 
 **The master is the deployment artefact, and it has to be on the current
 build.** A terminal from an older package downloads its update on the first
-login — about 190 MB — and that download starves the deal-history fetch, so that
-first sync fails with "no deal history arrived" while reporting the balance
-perfectly correctly; every clone repeats it. A terminal that has been in service
+login — about 190 MB — and applies it on its next start, so every clone of it
+pays for that on its first sync. A terminal that has been in service
 has already applied the update and accumulated the broker list.
 `make-master.sh` promotes one to master and strips what must not travel with it
 — above all `Config/accounts.dat`, which holds the credentials of every account
@@ -776,23 +809,18 @@ hundred accounts served, not the price of the box.
 
 **What a full run looks like.** The 99-account test list on the 16-terminal
 box, registered eight at a time: 51 active, 33 rejected by their brokers (the
-same credentials fail on Windows), 14 with history withheld (accounts that had
-been logged in repeatedly that day), one timeout. 108 syncs, median 14.5 s, p90
+same credentials fail on Windows), one timeout. 108 syncs, median 14.5 s, p90
 62 s, max 205 s; the accounts spread over the terminals two to five each. On
 the earlier 6-core box: 63 of 100 active, zero failures across hard-sync storms
 of 20 and 50 concurrent, a background cycle of 6.3 s per account.
 
-**Testing a pool, and what not to test it with.** Use accounts that have not
-been logging in all day, and never the same handful from a string of fresh
-terminals. A cold pool checked with the same five accounts a dozen times over
-one morning ended with every one of them failing "no deal history arrived" at
-30 s, 90 s and 150 s alike and three of them locked (`Invalid account`) — while
-five other valid accounts, untouched that day, synced first time through the
-very same terminals with history in 3–5 s. Repeated logins from new terminal
-identities make brokers withhold history and then refuse the login; that is the
-test, not the pool, and it takes days to clear. `verify-pool.py` runs two rounds
-of hard syncs over every active account and exits non-zero if the last one still
-fails, so it can gate a deploy.
+**Testing a pool, and what not to test it with.** Never log the same handful
+of accounts in from a string of fresh terminals: brokers count logins per
+device, and an account that visits a dozen new terminal identities in a
+morning gets locked (`Invalid account`) for days — that is the pin's whole
+reason to exist, and a test that defeats it tests nothing. `verify-pool.py`
+runs one round of hard syncs over every active account, on their own
+terminals, and exits non-zero if any failed, so it can gate a deploy.
 
 **Operating it.**
 

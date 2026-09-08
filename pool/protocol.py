@@ -45,3 +45,4 @@ class SyncResult:
     worker_id: str | None = None
     sync_run_id: str | None = None
     kind: SyncKind = SyncKind.scheduled
+    history_withheld: bool = False

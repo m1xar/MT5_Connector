@@ -48,6 +48,7 @@ class MT5Account(SQLModel, table=True):
 
     last_synced_at: Optional[datetime] = Field(default=None, sa_column=_utc_column(index=True))
     last_error: Optional[str] = Field(default=None)
+    history_withheld_until: Optional[datetime] = Field(default=None, sa_column=_utc_column())
     created_at: datetime = Field(default_factory=utc_now, sa_column=_utc_column(index=True))
     updated_at: datetime = Field(default_factory=utc_now, sa_column=_utc_column())
 

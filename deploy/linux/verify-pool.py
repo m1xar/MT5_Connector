@@ -4,14 +4,9 @@
     python3 deploy/linux/verify-pool.py --base http://127.0.0.1:8030 \
         --token "$MT5_API_API_TOKEN" --parallel 12
 
-Runs two rounds of hard syncs over every active account. The first round is
-the warm-up: clones that have never logged in spend it downloading their build
-update, and some syncs fail with "no deal history arrived" while that download
-starves the history fetch. The second round is the verdict - on a healthy pool
-it comes back clean.
-
-Exits non-zero if the second round still has failures, so it can gate a
-deploy.
+Runs one round of hard syncs over every active account and exits non-zero
+if any of them failed, so it can gate a deploy. --rounds runs more than one
+and judges the last.
 """
 
 from __future__ import annotations
@@ -61,7 +56,7 @@ def main() -> int:
     parser.add_argument("--base", default="http://127.0.0.1:8030")
     parser.add_argument("--token", required=True)
     parser.add_argument("--parallel", type=int, default=12, help="set this to the pool size")
-    parser.add_argument("--rounds", type=int, default=2)
+    parser.add_argument("--rounds", type=int, default=1)
     args = parser.parse_args()
 
     status, listing, _ = call(args.base, args.token, "GET", "/accounts", timeout=120)
@@ -92,9 +87,8 @@ def main() -> int:
 
         durations.sort()
         median = durations[len(durations) // 2] if durations else 0.0
-        label = "first pass" if round_no < args.rounds else "verify"
         print(
-            f"round {round_no} ({label}): {len(durations)} ok, {len(failures)} failed, "
+            f"round {round_no}: {len(durations)} ok, {len(failures)} failed, "
             f"median {median:.1f}s, wall {time.time() - started:.0f}s"
         )
         for message in failures[:5]:

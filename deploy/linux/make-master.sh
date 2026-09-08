@@ -5,10 +5,8 @@
 #   bash deploy/linux/make-master.sh t1
 #
 # Why this exists. A terminal installed from any older package downloads its
-# build update on the first login - about 190 MB - and that download starves
-# the deal-history fetch, so that first sync fails with "no deal history
-# arrived" while reporting the balance perfectly correctly. Every clone of
-# that master repeats it.
+# build update on the first login - about 190 MB - and applies it on the next
+# start, so the first sync of every clone of that master pays for it.
 #
 # A terminal that has already run has both halves solved: it downloaded the
 # update and applied it on its next start, and it has accumulated the broker

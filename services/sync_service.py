@@ -17,6 +17,7 @@ from repositories.transaction_repo import TransactionRepository
 from utils.config import settings
 from utils.logging import bind_context, log_event, reset_context
 
+from .account_service import AccountService
 from .terminal_affinity import ensure_assigned
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,10 @@ class SyncService:
             return
 
         payload = result.payload
+        if result.history_withheld:
+            await self._persist_withheld(session, account_repo, account, result)
+            return
+
         positions_count = await PositionRepository(session).upsert_many(account.account_id, payload.positions)
         open_count = await OpenPositionRepository(session).replace_all(account.account_id, payload.open_positions)
         transactions_count = await TransactionRepository(session).upsert_many(account.account_id, payload.transactions)
@@ -124,4 +129,28 @@ class SyncService:
             kind=result.kind.value, positions=positions_count, open_positions=open_count,
             new_transactions=transactions_count, server_clock_switches=max(len(payload.server_clock) - 1, 0),
             duration_ms=result.duration_ms,
+        )
+
+    async def _persist_withheld(
+        self, session: AsyncSession, account_repo: AccountRepository, account: MT5Account, result: SyncResult
+    ) -> None:
+        payload = result.payload
+        if result.kind is SyncKind.initial:
+            await AccountService(session).delete(account)
+            log_event(logger, "warning", "sync.persist.withheld.rejected", login=account.login, server=account.server)
+            return
+        open_count = await OpenPositionRepository(session).replace_all(account.account_id, payload.open_positions)
+        await account_repo.mark_withheld(
+            account,
+            balance=payload.account_info.balance,
+            equity=payload.equity,
+            leverage=payload.account_info.leverage,
+            currency=payload.account_info.currency,
+            server_clock=payload.server_clock,
+            pause_minutes=settings.history_withheld_pause_minutes,
+        )
+        log_event(
+            logger, "warning", "sync.persist.withheld",
+            kind=result.kind.value, open_positions=open_count,
+            until=account.history_withheld_until.isoformat(), duration_ms=result.duration_ms,
         )

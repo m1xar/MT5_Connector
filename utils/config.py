@@ -19,7 +19,8 @@ class Settings(BaseSettings):
     terminal_init_timeout_ms: int = 30000
     terminal_login_timeout_ms: int = 30000
     terminal_initial_connect_timeout_ms: int = 120000
-    history_settle_timeout_seconds: float = 30.0
+    history_settle_timeout_seconds: float = 10.0
+    history_withheld_pause_minutes: int = 60
     prune_cache_after_sync: bool = True
 
     sync_interval_minutes: int = 15

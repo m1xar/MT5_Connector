@@ -39,10 +39,6 @@ class TerminalError(RuntimeError):
         self.terminal_lost = terminal_lost
 
 
-class HistoryNotReady(TerminalError):
-    pass
-
-
 class StartGate:
     def __init__(self, ctx: Any) -> None:
         self._lock = ctx.Lock()

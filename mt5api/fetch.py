@@ -18,12 +18,11 @@ from .raw import (
     RawPosition,
 )
 from .enrichment import DAY, MINUTE
-from .terminal import HistoryNotReady, MT5Terminal, is_ipc
+from .terminal import MT5Terminal, is_ipc
 from .timeutil import as_mt5_time, as_server_time, history_range
 
 logger = logging.getLogger(__name__)
 
-_ZERO_SETTLE_SECONDS = 5.0
 _SETTLE_POLL_SECONDS = 1.0
 _SETTLE_STABLE_READS = 2
 
@@ -78,31 +77,26 @@ def wait_for_history(
             code, description = terminal.mt5.last_error()
             if is_ipc(code):
                 raise terminal.failure(f"history_deals_total failed: {description}", code)
-            time.sleep(_SETTLE_POLL_SECONDS)
-            continue
-        if total == previous:
+        elif total == previous:
             stable += 1
         else:
             previous, stable = total, 1
-
-        if total > 0 and stable >= _SETTLE_STABLE_READS:
+        if (total and stable >= _SETTLE_STABLE_READS) or time.monotonic() >= deadline:
             break
-        if total == 0 and not account.balance and time.monotonic() - started >= _ZERO_SETTLE_SECONDS:
-            break
-        if time.monotonic() >= deadline:
-            if total > 0 or not account.balance:
-                break
-            raise HistoryNotReady(
-                f"no deal history arrived for {account.login} in {timeout_seconds:.0f}s, yet the "
-                f"account holds {account.balance} {account.currency} - the terminal is still "
-                f"downloading, or the history is unavailable"
-            )
         time.sleep(_SETTLE_POLL_SECONDS)
 
     log_event(
         logger, "info", "terminal.history.settled",
         login=account.login, deals=total, waited_ms=int((time.monotonic() - started) * 1000),
     )
+
+
+def history_withheld(history: RawHistory) -> bool:
+    if history.deals:
+        return False
+    account = history.account
+    round_balance = abs(account.balance - round(account.balance, -1)) <= 0.005
+    return bool(history.positions) or not round_balance or account.equity != account.balance
 
 
 def _clock_symbols(deals: list[RawDeal]) -> list[str]:

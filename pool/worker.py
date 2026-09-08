@@ -6,16 +6,14 @@ from typing import Any
 
 from mt5api.cache import prune_price_cache
 from mt5api.enrichment import enrich_mae_mfe
-from mt5api.fetch import fetch_candles, fetch_history
+from mt5api.fetch import fetch_candles, fetch_history, history_withheld
 from mt5api.payload import build_sync_payload
-from mt5api.terminal import HistoryNotReady, MT5Terminal, StartGate, TerminalError
+from mt5api.terminal import MT5Terminal, StartGate, TerminalError
 from utils.logging import configure_logging, log_event
 
 from .protocol import SyncResult, SyncTask
 
 logger = logging.getLogger(__name__)
-
-_RETRY_SETTLE_FACTOR = 4
 
 
 def worker_main(
@@ -76,20 +74,11 @@ def _run_task(
         worker_id=worker_id, sync_run_id=task.sync_run_id, kind=task.kind,
     )
     try:
-        for attempt in (1, 2):
-            try:
-                terminal.connect(task.login, task.password, task.server, timeout_ms=task.connect_timeout_ms)
-                settle = history_settle_timeout_seconds * (_RETRY_SETTLE_FACTOR if attempt == 2 else 1)
-                payload = build_sync_payload(fetch_history(terminal, settle_timeout_seconds=settle))
-                break
-            except HistoryNotReady as exc:
-                if attempt == 2:
-                    raise
-                log_event(
-                    logger, "warning", "worker.history.retry",
-                    worker_id=worker_id, account_id=task.account_id, login=task.login, error=str(exc),
-                )
-        if with_mae_mfe:
+        terminal.connect(task.login, task.password, task.server, timeout_ms=task.connect_timeout_ms)
+        history = fetch_history(terminal, settle_timeout_seconds=history_settle_timeout_seconds)
+        result.history_withheld = history_withheld(history)
+        payload = build_sync_payload(history)
+        if with_mae_mfe and not result.history_withheld:
             enrich_mae_mfe(
                 payload.positions,
                 lambda symbol, interval, start, end: fetch_candles(terminal, symbol, interval, start, end),
@@ -120,6 +109,6 @@ def _run_task(
     log_event(
         logger, "info", "worker.task.completed",
         worker_id=worker_id, account_id=task.account_id, positions=len(payload.positions),
-        duration_ms=result.duration_ms,
+        history_withheld=result.history_withheld, duration_ms=result.duration_ms,
     )
     return result

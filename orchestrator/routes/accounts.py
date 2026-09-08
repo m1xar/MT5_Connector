@@ -46,9 +46,18 @@ router = APIRouter(tags=["Accounts"], responses=COMMON_RESPONSES, dependencies=[
         "marked `error_connection` straight away - it has never connected, so "
         "there is nothing for the failure to be a blip in. The request blocks "
         "on that sync and returns the settled account, or **502** with the "
-        "account id and the error if it did not complete."
+        "account id and the error if it did not complete.\n\n"
+        "Use the **investor password**. A master password logs in just as well, "
+        "but a broker that sees the owner's own terminal connected withholds "
+        "the deal history from the second session, and the sync would record an "
+        "account with money and no trades. When that happens the account is not "
+        "kept and the response is **422** `history_withheld`."
     ),
-    responses={**COMMON_RESPONSES, 409: {"model": ErrorResponse, "description": "Already exists"}},
+    responses={
+        **COMMON_RESPONSES,
+        409: {"model": ErrorResponse, "description": "Already exists"},
+        422: {"description": "Logged in, but the broker withheld the deal history - register with the investor password"},
+    },
 )
 async def create_account(
     data: AccountCreateRequest,
@@ -73,6 +82,19 @@ async def create_account(
         await asyncio.wait_for(asyncio.shield(future), timeout=settings.hard_sync_wait_timeout_seconds)
     except asyncio.TimeoutError:
         log_event(logger, "warning", "account.initial_sync.wait_timeout", account_id=account.account_id)
+
+    if future.done() and future.result().ok and future.result().history_withheld:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "history_withheld",
+                "detail": (
+                    f"{data.login}@{data.server} logged in, but the broker returned no deal history "
+                    "for an account with open positions / a non-round balance. "
+                    "Register it with the investor password."
+                ),
+            },
+        )
 
     async with async_session_factory() as fresh:
         account = await load_account(fresh, account.account_id)
@@ -112,8 +134,10 @@ async def get_account(account_id: str, session: AsyncSession = Depends(get_sessi
     summary="Update an account",
     description=(
         "Disabling an account removes it from scheduled syncs but keeps its data. "
-        "Supplying a new password clears the failure count and restores `active`, "
-        "so a fixed account is picked up again."
+        "Supplying a new password clears the failure count, restores `active` and "
+        "lifts a `history_withheld_until` pause, so a fixed account is picked up "
+        "again - this is how an account registered with a master password is "
+        "moved to its investor password."
     ),
 )
 async def update_account(account_id: str, data: AccountUpdateRequest, session: AsyncSession = Depends(get_session)):
