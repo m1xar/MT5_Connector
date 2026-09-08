@@ -89,6 +89,7 @@ class MT5Terminal:
         proxy: Proxy | None = None,
         managed: bool = False,
         proxy_probe_timeout_seconds: float = 10.0,
+        cold_start_timeout_ms: int | None = None,
     ) -> None:
         self.path = path
         self.init_timeout_ms = init_timeout_ms
@@ -98,6 +99,7 @@ class MT5Terminal:
         self.proxy = proxy
         self.managed = managed
         self.proxy_probe_timeout_seconds = proxy_probe_timeout_seconds
+        self.cold_start_timeout_ms = cold_start_timeout_ms
         self._mt5: Any | None = None
         self._current_login: tuple[int, str, str] | None = None
 
@@ -133,7 +135,8 @@ class MT5Terminal:
         except ImportError as exc:
             raise TerminalError("MetaTrader5 package is unavailable; the workers only run on Windows") from exc
         if self.managed:
-            self._prepare(login, password, server)
+            if self._prepare(login, password, server) and self.cold_start_timeout_ms:
+                timeout_ms = max(timeout_ms, self.cold_start_timeout_ms)
         try:
             ok = module.initialize(
                 path=self.path, login=login, password=password, server=server,
@@ -152,12 +155,12 @@ class MT5Terminal:
             proxy=marker_for(self.proxy) if self.managed else None,
         )
 
-    def _prepare(self, login: int, password: str, server: str) -> None:
+    def _prepare(self, login: int, password: str, server: str) -> bool:
         wanted = marker_for(self.proxy)
         running = pids_of(self.path)
         if running and read_marker(self.path) == wanted:
             log_event(logger, "info", "terminal.attach", path=self.path, pids=running, proxy=wanted)
-            return
+            return False
         if running:
             log_event(
                 logger, "warning", "terminal.kill",
@@ -166,7 +169,7 @@ class MT5Terminal:
             terminate_all(self.path)
         if self.proxy is None:
             write_marker(self.path, None)
-            return
+            return True
         if not probe(self.proxy, self.proxy_probe_timeout_seconds):
             raise TerminalError(f"proxy {self.proxy.endpoint} did not answer the probe", proxy_dead=True)
         ini = write_startup_ini(self.path, login, password, server, self.proxy)
@@ -178,6 +181,7 @@ class MT5Terminal:
             time.sleep(0.5)
         time.sleep(_LAUNCH_SETTLE_SECONDS)
         log_event(logger, "info", "terminal.launched", path=self.path, proxy=wanted, pids=pids_of(self.path))
+        return True
 
     def _login(self, login: int, password: str, server: str, timeout_ms: int) -> None:
         self._current_login = None

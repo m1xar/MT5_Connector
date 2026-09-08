@@ -34,6 +34,7 @@ def worker_main(
     proxy: Proxy | None,
     managed: bool,
     proxy_probe_timeout_seconds: float,
+    cold_start_timeout_ms: int,
 ) -> None:
     configure_logging(log_level, log_json)
     terminal = MT5Terminal(
@@ -45,6 +46,7 @@ def worker_main(
         proxy=proxy,
         managed=managed,
         proxy_probe_timeout_seconds=proxy_probe_timeout_seconds,
+        cold_start_timeout_ms=cold_start_timeout_ms,
     )
     connection.send(worker_id)
     log_event(

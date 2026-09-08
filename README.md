@@ -120,7 +120,10 @@ fails, the failure is the proxy's, not the account's: the worker kills the
 terminal, the pool takes another proxy from the list, restarts the worker
 with it, and re-runs the task without spending one of its retries, so even an
 initial sync survives it and no account collects a strike. The probe also
-runs before every cold start. If the list cannot be fetched either, the
+runs before every cold start, and a terminal the worker launched itself gets
+the initial-sync connect timeout to come up in, whatever the task's own was —
+under Wine a cold start behind a proxy takes about a minute, and a routine
+30 s would fail it once and succeed on the retry. If the list cannot be fetched either, the
 terminal connects **directly** and the pool notes it (`proxy.unproxied`);
 once an hour (`MT5_API_PROXY_RECHECK_MINUTES`) the reaper asks again and, if
 a proxy comes back, restarts that worker while it is idle.

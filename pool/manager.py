@@ -65,6 +65,7 @@ class PoolManager:
         proxy_registry: ProxyRegistry | None = None,
         proxy_probe_timeout_seconds: float = 10.0,
         proxy_recheck_minutes: int = 60,
+        cold_start_timeout_ms: int = 120000,
     ) -> None:
         self.terminal_paths = terminal_paths
         self._proxies = proxies
@@ -89,6 +90,7 @@ class PoolManager:
             "start_gate": StartGate(self._mp),
             "managed": proxies is not None,
             "proxy_probe_timeout_seconds": proxy_probe_timeout_seconds,
+            "cold_start_timeout_ms": cold_start_timeout_ms,
         }
 
         self._workers: dict[str, WorkerHandle] = {}
