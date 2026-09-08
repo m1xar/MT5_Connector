@@ -8,6 +8,7 @@ from mt5api.cache import prune_price_cache
 from mt5api.enrichment import enrich_mae_mfe
 from mt5api.fetch import fetch_candles, fetch_history, history_withheld
 from mt5api.payload import build_sync_payload
+from mt5api.proxy import Proxy
 from mt5api.terminal import MT5Terminal, StartGate, TerminalError
 from utils.logging import configure_logging, log_event
 
@@ -30,6 +31,9 @@ def worker_main(
     history_settle_timeout_seconds: float,
     prune_cache_after_sync: bool,
     start_gate: StartGate,
+    proxy: Proxy | None,
+    managed: bool,
+    proxy_probe_timeout_seconds: float,
 ) -> None:
     configure_logging(log_level, log_json)
     terminal = MT5Terminal(
@@ -38,9 +42,15 @@ def worker_main(
         login_timeout_ms=login_timeout_ms,
         portable=portable,
         start_gate=start_gate,
+        proxy=proxy,
+        managed=managed,
+        proxy_probe_timeout_seconds=proxy_probe_timeout_seconds,
     )
     connection.send(worker_id)
-    log_event(logger, "info", "worker.started", worker_id=worker_id, terminal_path=terminal_path)
+    log_event(
+        logger, "info", "worker.started",
+        worker_id=worker_id, terminal_path=terminal_path, proxy=proxy.endpoint if proxy else None,
+    )
 
     try:
         while True:
@@ -86,15 +96,16 @@ def _run_task(
             )
     except TerminalError as exc:
         if exc.terminal_lost:
-            terminal.reset()
+            terminal.reset(kill=exc.proxy_dead)
         else:
             terminal.forget_login()
         result.error, result.error_code, result.terminal_lost = str(exc), exc.code, exc.terminal_lost
+        result.proxy_dead = exc.proxy_dead
         result.duration_ms = int((time.perf_counter() - started) * 1000)
         log_event(
             logger, "warning", "worker.task.failed",
             worker_id=worker_id, account_id=task.account_id, error=result.error,
-            error_code=exc.code, terminal_lost=exc.terminal_lost,
+            error_code=exc.code, terminal_lost=exc.terminal_lost, proxy_dead=exc.proxy_dead,
         )
         return result
     except Exception as exc:

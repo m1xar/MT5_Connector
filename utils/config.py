@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     history_settle_timeout_seconds: float = 10.0
     history_withheld_pause_minutes: int = 60
     prune_cache_after_sync: bool = True
+    webshare_api_key: str = ""
+    proxy_probe_timeout_seconds: float = 10.0
+    proxy_recheck_minutes: int = 60
 
     sync_interval_minutes: int = 15
     sync_scheduler_tick_seconds: int = 60
@@ -54,6 +57,8 @@ class Settings(BaseSettings):
                 issues.append(f"terminal not found: {path}")
         if not self.api_token:
             issues.append("MT5_API_API_TOKEN is empty, so every route is unauthenticated")
+        if not self.webshare_api_key:
+            issues.append("MT5_API_WEBSHARE_API_KEY is empty, so the terminals connect without proxies")
         return issues
 
 

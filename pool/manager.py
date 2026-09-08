@@ -9,7 +9,9 @@ from itertools import count
 from typing import Awaitable, Callable
 
 from domain.enums import SyncKind
+from mt5api.proxy import Proxy
 from mt5api.terminal import AUTHORIZATION_FAILED, StartGate
+from services.proxy_service import ProxyRegistry
 from utils.logging import log_event
 
 from .protocol import PRIORITY_HARD, PRIORITY_SCHEDULED, SyncResult, SyncTask, WorkerState
@@ -32,6 +34,7 @@ class _QueuedTask:
     future: asyncio.Future[SyncResult]
     max_retries: int | None
     attempts: int = 0
+    proxy_rotations: int = 0
 
 
 @dataclass(slots=True)
@@ -58,8 +61,16 @@ class PoolManager:
         log_level: str,
         log_json: bool,
         enrich_mae_mfe: bool,
+        proxies: dict[str, Proxy | None] | None = None,
+        proxy_registry: ProxyRegistry | None = None,
+        proxy_probe_timeout_seconds: float = 10.0,
+        proxy_recheck_minutes: int = 60,
     ) -> None:
         self.terminal_paths = terminal_paths
+        self._proxies = proxies
+        self._proxy_registry = proxy_registry
+        self._proxy_recheck_seconds = proxy_recheck_minutes * 60.0
+        self._reproxy_due = 0.0
         self.on_result: ResultHandler | None = None
         self.task_timeout_seconds = task_timeout_seconds
         self.max_task_retries = max_task_retries
@@ -76,6 +87,8 @@ class PoolManager:
             "history_settle_timeout_seconds": history_settle_timeout_seconds,
             "prune_cache_after_sync": prune_cache_after_sync,
             "start_gate": StartGate(self._mp),
+            "managed": proxies is not None,
+            "proxy_probe_timeout_seconds": proxy_probe_timeout_seconds,
         }
 
         self._workers: dict[str, WorkerHandle] = {}
@@ -95,6 +108,7 @@ class PoolManager:
                 target=worker_main,
                 worker_kwargs=self._worker_kwargs,
                 start_timeout_seconds=self._worker_start_timeout,
+                proxy=(self._proxies or {}).get(path),
             )
             for index, path in enumerate(self.terminal_paths)
         }
@@ -105,6 +119,7 @@ class PoolManager:
             asyncio.create_task(self._dispatch_loop(worker), name=f"pool-dispatcher-{worker.worker_id}")
             for worker in workers
         ]
+        self._reproxy_due = asyncio.get_running_loop().time() + self._proxy_recheck_seconds
         self._reaper = asyncio.create_task(self._reap_loop(), name="pool-reaper")
         log_event(
             logger, "info", "pool.started",
@@ -242,6 +257,9 @@ class PoolManager:
         while not self._closing:
             try:
                 await asyncio.sleep(_REAP_INTERVAL_SECONDS)
+                if self._proxy_registry and asyncio.get_running_loop().time() >= self._reproxy_due:
+                    self._reproxy_due = asyncio.get_running_loop().time() + self._proxy_recheck_seconds
+                    await self._reproxy_idle()
                 failed = [worker for worker in self._workers.values() if worker.state is WorkerState.failed]
                 if not failed:
                     continue
@@ -255,6 +273,22 @@ class PoolManager:
                 raise
             except Exception as exc:
                 log_event(logger, "error", "pool.reap.failed", error=f"{type(exc).__name__}: {exc}")
+
+    async def _reproxy_idle(self) -> None:
+        for worker in self._workers.values():
+            if worker.proxy is not None or worker.state is not WorkerState.idle or self._closing:
+                continue
+            proxy = await self._proxy_registry.rotate(worker.terminal_path, None)
+            if proxy is None or worker.state is not WorkerState.idle:
+                continue
+            worker.proxy = proxy
+            worker.state = WorkerState.restarting
+            worker.ready.clear()
+            log_event(logger, "info", "pool.worker.reproxied", worker_id=worker.worker_id, proxy=proxy.endpoint)
+            if await worker.restart():
+                worker.mark_idle()
+            else:
+                worker.mark_failed()
 
     async def _execute(self, worker: WorkerHandle, item: _QueuedTask) -> None:
         try:
@@ -286,6 +320,16 @@ class PoolManager:
         if self._closing:
             self._resolve(item, self._failure(worker, item, "pool is shutting down"))
             return
+
+        if result.proxy_dead and self._proxy_registry is not None:
+            dead = worker.proxy
+            worker.proxy = await self._proxy_registry.rotate(worker.terminal_path, dead)
+            log_event(
+                logger, "warning", "pool.worker.proxy_rotated",
+                worker_id=worker.worker_id, dead=dead.endpoint if dead else None,
+                proxy=worker.proxy.endpoint if worker.proxy else None,
+            )
+            worker_healthy = False
 
         if not worker_healthy:
             worker_healthy = await worker.restart()
@@ -324,6 +368,11 @@ class PoolManager:
         if result.error_code == AUTHORIZATION_FAILED:
             log_event(logger, "info", "pool.task.not_retrying", account_id=item.task.account_id, error_code=result.error_code)
             return False
+        if result.proxy_dead and item.proxy_rotations == 0:
+            item.proxy_rotations += 1
+            item.attempts -= 1
+            log_event(logger, "info", "pool.task.retrying_after_proxy", account_id=item.task.account_id)
+            return True
         limit = self.max_task_retries if item.max_retries is None else item.max_retries
         if item.attempts > limit:
             return False

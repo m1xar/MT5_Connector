@@ -46,3 +46,4 @@ class SyncResult:
     sync_run_id: str | None = None
     kind: SyncKind = SyncKind.scheduled
     history_withheld: bool = False
+    proxy_dead: bool = False

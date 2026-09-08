@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Mapping
 
-from pydantic import BaseModel, ConfigDict, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from pool.manager import PoolStatus
 from pool.protocol import WorkerState
@@ -14,6 +14,7 @@ class WorkerStatusResponse(BaseModel):
 
     worker_id: str
     terminal_path: str
+    proxy: str | None = Field(default=None, validation_alias="proxy_endpoint")
     state: WorkerState
     pid: int | None
     current_account_id: str | None

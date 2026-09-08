@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from mt5api.proxy import Proxy
 from utils.logging import log_event
 
 from .protocol import SyncResult, SyncTask, WorkerState
@@ -27,6 +28,7 @@ class WorkerHandle:
     target: Callable[..., None]
     worker_kwargs: dict[str, Any]
     start_timeout_seconds: float
+    proxy: Proxy | None = None
 
     state: WorkerState = WorkerState.starting
     process: Any = None
@@ -49,13 +51,17 @@ class WorkerHandle:
     def queue_depth(self) -> int:
         return self.queue.qsize()
 
+    @property
+    def proxy_endpoint(self) -> str | None:
+        return self.proxy.endpoint if self.proxy else None
+
     async def spawn(self) -> bool:
         try:
             parent_conn, child_conn = self.mp_context.Pipe()
             process = self.mp_context.Process(
                 target=self.target,
                 args=(self.worker_id, self.terminal_path, child_conn),
-                kwargs=self.worker_kwargs,
+                kwargs={**self.worker_kwargs, "proxy": self.proxy},
                 daemon=True,
                 name=f"mt5-worker-{self.worker_id}",
             )

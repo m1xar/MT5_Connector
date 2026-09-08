@@ -10,8 +10,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from db.session import dispose_db, init_db
+from db.session import async_session_factory, dispose_db, init_db
 from pool.manager import PoolManager
+from services.proxy_service import ProxyRegistry, WebshareClient
 from services.sync_service import SyncService
 from utils.config import settings
 from utils.logging import bind_context, configure_logging, log_event, reset_context
@@ -36,6 +37,11 @@ async def lifespan(app: FastAPI):
         log_event(logger, "warning", "app.startup.config", problem=problem)
 
     paths = settings.terminals
+    proxy_registry = None
+    proxies = None
+    if settings.webshare_api_key:
+        proxy_registry = ProxyRegistry(WebshareClient(settings.webshare_api_key), async_session_factory)
+        proxies = await proxy_registry.load(paths)
     terminal_pool = PoolManager(
         paths,
         task_timeout_seconds=settings.sync_task_timeout_seconds,
@@ -49,6 +55,10 @@ async def lifespan(app: FastAPI):
         log_level=settings.log_level,
         log_json=settings.log_json,
         enrich_mae_mfe=settings.enrich_mae_mfe,
+        proxies=proxies,
+        proxy_registry=proxy_registry,
+        proxy_probe_timeout_seconds=settings.proxy_probe_timeout_seconds,
+        proxy_recheck_minutes=settings.proxy_recheck_minutes,
     )
     sync_service = SyncService(terminal_pool)
     terminal_pool.on_result = sync_service.persist

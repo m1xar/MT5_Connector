@@ -53,6 +53,15 @@ class MT5Account(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now, sa_column=_utc_column())
 
 
+class MT5TerminalProxy(SQLModel, table=True):
+    __tablename__ = "mt5terminalproxy"
+
+    terminal_path: str = Field(primary_key=True)
+    address: str = Field()
+    port: int = Field()
+    assigned_at: datetime = Field(default_factory=utc_now, sa_column=_utc_column())
+
+
 class MT5Position(SQLModel, table=True):
     __tablename__ = "mt5position"
     __table_args__ = (UniqueConstraint("account_id", "external_id", name="uq_mt5position_account_external"),)

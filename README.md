@@ -83,6 +83,48 @@ reaper brings it back (see *When the pool goes wrong*). Two registrations that
 land at the same instant can read the same counts and pick the same terminal;
 later picks rebalance, nothing corrects it retroactively.
 
+## Proxies
+
+Every terminal connects through **its own proxy**, pinned to it the way an
+account is pinned to a terminal: a broker sees one terminal always arriving
+from one address. The proxies come from Webshare; `MT5_API_WEBSHARE_API_KEY`
+is the whole configuration, and leaving it empty means no proxies at all.
+
+The terminal takes proxy settings only from a start-up file
+(`terminal64.exe /portable /config:<ini>`; its own `common.ini` keeps settings
+in an encrypted blob), and it ignores the `ProxyLogin`/`ProxyPassword` keys
+that file documents — measured on build 6182, both SOCKS5 and HTTP fail with
+"enter login & password". So authentication is by **IP**: the service puts
+this box's public address on Webshare's IP-authorization list, and the
+terminal is given an HTTP proxy with no credentials. The plan allows one
+authorized IP, so one box is proxied at a time; a second box that starts with
+the same key takes the slot, and the first finds its proxies dead. Nothing
+secret is ever written to disk: the start-up file carries the account
+credentials for the seconds between launch and `initialize()` and is deleted
+in either case.
+
+Which terminal has which proxy is stored in `mt5terminalproxy` and survives
+restarts. On start the list is fetched once; a terminal whose proxy is no
+longer on it gets another, unassigned one. `GET /pool/status` shows `proxy`
+per worker.
+
+Because the worker launches the terminal itself, it also owns it: before a
+cold start it checks what is running on its path and what that instance was
+launched with (`config/mt5api-proxy.txt`), attaches if they agree, and
+otherwise kills the instance and launches afresh. Under Wine a killed
+terminal is just a process; nothing else is touched.
+
+**When a proxy dies.** Every IPC failure on a proxied terminal is followed by
+a probe through the proxy — a `CONNECT` to Webshare's own IP echo. If it
+fails, the failure is the proxy's, not the account's: the worker kills the
+terminal, the pool takes another proxy from the list, restarts the worker
+with it, and re-runs the task without spending one of its retries, so even an
+initial sync survives it and no account collects a strike. The probe also
+runs before every cold start. If the list cannot be fetched either, the
+terminal connects **directly** and the pool notes it (`proxy.unproxied`);
+once an hour (`MT5_API_PROXY_RECHECK_MINUTES`) the reaper asks again and, if
+a proxy comes back, restarts that worker while it is idle.
+
 ## Data model
 
 Canonical models live in `domain/fx.py` and mirror the Go structs field for
@@ -187,7 +229,8 @@ pool/
   protocol.py       what crosses the pipe: SyncTask, SyncResult, WorkerState
 
 mt5api/
-  terminal.py       the only module that imports MetaTrader5; start gate, probe
+  terminal.py       the only module that imports MetaTrader5; start gate, probe, launching behind a proxy
+  proxy.py          the proxy, the start-up ini and marker the terminal is launched with, the probe
   fetch.py          every read off a terminal: account, deals, orders, candles, clock cache
   clock.py          the server's UTC offset per switch, read off the trading week
   enrichment.py     money factors, RR, MAE/MFE
@@ -201,8 +244,8 @@ mt5api/
 domain/             fx.py (canonical models and SyncPayload), models.py (tables), enums.py
 repositories/       queries and flush, no commits
 services/           transaction boundaries: account, sync (with the scheduler), query;
-                    terminal_affinity picks and stores the pin
-utils/              config, logging
+                    terminal_affinity picks and stores the pin; proxy_service talks to Webshare
+utils/              config, logging, procs (finding and killing a terminal by path)
 
 deploy/             Windows: open-master, clone, prune-history
 deploy/linux/       install, make-master, clone-pool, service, verify-pool, docker-compose
@@ -220,7 +263,7 @@ deploy/linux/       install, make-master, clone-pool, service, verify-pool, dock
 | GET | `/accounts/{id}/open-positions` | live exposure as of the last sync |
 | GET | `/accounts/{id}/balance-snapshots?days=N` | derived on read |
 | GET | `/accounts/{id}/transactions?days=N` | deposits/withdrawals |
-| GET | `/pool/status` | per worker: state, pid, its queue depth, accounts pinned to it, counters; pool totals |
+| GET | `/pool/status` | per worker: state, pid, proxy, its queue depth, accounts pinned to it, counters; pool totals |
 | GET | `/healthz` | public liveness: `ok`, `degraded`, `stalled` |
 
 `days=0` means "everything". `/healthz` reports `degraded` when a terminal is
@@ -918,9 +961,10 @@ at all:
 | `MT5_API_WORKER_START_TIMEOUT_SECONDS` | 300 under Wine |
 | `MT5_API_SYNC_INTERVAL_MINUTES` | how stale an account may get before the scheduler re-queues it; 15 in production |
 | `MT5_API_PRUNE_CACHE_AFTER_SYNC` | on by default; without it the price cache grows without bound |
+| `MT5_API_WEBSHARE_API_KEY` | one proxy per terminal, see *Proxies*; empty means direct connections |
 
 Startup logs an `app.startup.config` warning for each terminal path that is not
-there, an empty pool, and a missing token. Then check `GET /healthz` and
+there, an empty pool, a missing token and a missing Webshare key. Then check `GET /healthz` and
 `GET /pool/status`: one worker per path, all idle.
 
 **Database connections.** A request holds a pooled connection only while it
