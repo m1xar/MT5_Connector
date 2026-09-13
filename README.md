@@ -217,6 +217,20 @@ stop loss it sees, not the last — otherwise a stop trailed to breakeven would
 erase the risk it was taken with. This is a deliberate divergence from the Go
 version, which keeps the last.
 
+Where it looks is the order history, and that has a hole. An order carries the
+stop it was *placed* with, and a stop set on the open position afterwards
+creates no order at all — not even the order that later closes the position by
+that stop carries it. The closing deal does know: MQL5 reads it as
+`DEAL_SL`/`DEAL_TP`, and that is what the terminal's own History tab shows.
+But the Python package exposes no such field on a deal, on any version up to
+5.0.6180. What it does pass through is the deal's comment, and a server that
+closes a position by its stop writes the price there — `[sl 1.16258]`,
+`[tp 1.16231]`. So when the orders carry nothing, `_protection` takes the stop
+out of the closing deal's comment. That recovers every stop-out and every
+take-profit hit; a position closed by hand with a stop it never reached still
+carries none, and so does one whose stop was only ever set on the position and
+never triggered.
+
 ## Layout
 
 ```

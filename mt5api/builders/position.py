@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import re
+
 from domain import fx
 
 from .. import raw
 from ..enrichment import apply_rr, resolve_value_per_price_unit, value_per_lot
 from ..numbers import abs8, round8, weighted_price
 from .orders import build_orders, build_orders_from_deals, trade_side
+
+
+_PROTECTION_COMMENT = re.compile(r"\[(sl|tp) (\d+(?:\.\d+)?)\]", re.IGNORECASE)
 
 
 def _sort_deals(deals: list[raw.RawDeal]) -> list[raw.RawDeal]:
@@ -81,7 +86,7 @@ def _build_fx_position(
     net = pnl + swap - commission - fee
 
     position_orders = build_orders(orders, deals, position_key) or build_orders_from_deals(deals, position_key)
-    take_profit, stop_loss = _protection(orders)
+    take_profit, stop_loss = _protection(orders, deals)
 
     return fx.FXPosition(
         id=position_key,
@@ -106,7 +111,7 @@ def _build_fx_position(
     )
 
 
-def _protection(orders: list[raw.RawOrder]) -> tuple[float | None, float | None]:
+def _protection(orders: list[raw.RawOrder], deals: list[raw.RawDeal]) -> tuple[float | None, float | None]:
     take_profit: float | None = None
     stop_loss: float | None = None
     for order in sorted(orders, key=lambda order: (order.time_setup is None, order.time_setup)):
@@ -114,4 +119,10 @@ def _protection(orders: list[raw.RawOrder]) -> tuple[float | None, float | None]
             take_profit = order.tp
         if stop_loss is None and order.sl:
             stop_loss = order.sl
+    for deal in deals:
+        for kind, price in _PROTECTION_COMMENT.findall(deal.comment):
+            if kind.lower() == "tp" and take_profit is None:
+                take_profit = float(price)
+            if kind.lower() == "sl" and stop_loss is None:
+                stop_loss = float(price)
     return take_profit, stop_loss

@@ -74,6 +74,7 @@ class RawDeal:
     profit: float = 0.0
     fee: float = 0.0
     symbol: str = ""
+    comment: str = ""
 
     @property
     def is_trading(self) -> bool:
@@ -109,6 +110,7 @@ class RawDeal:
             profit=_float(row, "profit"),
             fee=_float(row, "fee"),
             symbol=_str(row, "symbol"),
+            comment=_str(row, "comment"),
         )
 
 
