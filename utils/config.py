@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     worker_start_timeout_seconds: float = 120.0
     enrich_mae_mfe: bool = True
     enrich_max_positions_per_sync: int = 5000
+    enrich_budget_seconds: float = 300.0
 
     api_token: str = ""
     api_host: str = "0.0.0.0"

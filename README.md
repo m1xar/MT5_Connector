@@ -748,13 +748,18 @@ position arrives carrying no MAE/MFE, so `PositionRepository` treats an absent
 value as "not recalculated" rather than "cleared" — otherwise the second sync's
 upsert would wipe what the first one measured.
 
-Incremental also means it can be **rationed**. A sync measures at most
-`MT5_API_ENRICH_MAX_POSITIONS_PER_SYNC` (5000) closed positions, newest first,
-and leaves the rest to the syncs that follow — the same mechanism that skips
-what is already measured picks up what was deferred. Without that an account
-with 464 000 deals never got past its first sync: every attempt ran into the
-900 s task timeout inside the enrichment, so nothing was ever written, and the
-next attempt started from zero.
+Incremental also means it can be **rationed**. A sync measures closed
+positions newest first for at most `MT5_API_ENRICH_BUDGET_SECONDS` (300) and
+at most `MT5_API_ENRICH_MAX_POSITIONS_PER_SYNC` (5000) of them, and leaves the
+rest to the syncs that follow — the same mechanism that skips what is already
+measured picks up what was deferred. Time is the bound that matters: a candle
+fetch costs 66 ms on a symbol the terminal is warm on and seconds on one it
+has to download, so a count says nothing about how long it takes. Without
+either an account with 468 000 deals never got past its first sync: pulling
+the history took 45 s, building 232 000 positions 80 s, handing the 180 MB
+result to the parent 37 s, and the enrichment then ran into the 900 s task
+timeout every time, so nothing was ever written and the next attempt started
+from zero.
 
 That account also showed what a symbol that cannot serve candles does to a loop
 that asks once per position: `EURUSD.s` answered every `copy_rates_range` with

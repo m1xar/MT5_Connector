@@ -28,6 +28,7 @@ def worker_main(
     log_json: bool,
     with_mae_mfe: bool,
     enrich_limit: int,
+    enrich_budget_seconds: float,
     portable: bool,
     history_settle_timeout_seconds: float,
     prune_cache_after_sync: bool,
@@ -64,7 +65,10 @@ def worker_main(
             if task is None:
                 break
             connection.send(
-                _run_task(terminal, worker_id, task, with_mae_mfe, enrich_limit, history_settle_timeout_seconds)
+                _run_task(
+                    terminal, worker_id, task, with_mae_mfe, enrich_limit, enrich_budget_seconds,
+                    history_settle_timeout_seconds,
+                )
             )
             if prune_cache_after_sync:
                 try:
@@ -82,6 +86,7 @@ def _run_task(
     task: SyncTask,
     with_mae_mfe: bool,
     enrich_limit: int,
+    enrich_budget_seconds: float,
     history_settle_timeout_seconds: float,
 ) -> SyncResult:
     started = time.perf_counter()
@@ -100,6 +105,7 @@ def _run_task(
                 lambda symbol, interval, start, end: fetch_candles(terminal, symbol, interval, start, end),
                 already_measured=task.already_measured,
                 limit=enrich_limit,
+                budget_seconds=enrich_budget_seconds,
             )
     except TerminalError as exc:
         if exc.terminal_lost:

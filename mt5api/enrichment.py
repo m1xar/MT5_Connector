@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Callable, Collection, Iterable, Mapping
 
@@ -111,6 +112,7 @@ def enrich_mae_mfe(
     fetch: CandleFetcher,
     already_measured: Collection[str] = (),
     limit: int | None = None,
+    budget_seconds: float | None = None,
 ) -> int:
     everything = list(positions)
     measured = set(already_measured)
@@ -130,7 +132,13 @@ def enrich_mae_mfe(
     enriched = rejected = skipped = 0
     failures: dict[str, int] = {}
     abandoned: set[str] = set()
-    for position in closed:
+    started = time.monotonic()
+    out_of_time = False
+    for index, position in enumerate(closed):
+        if budget_seconds is not None and time.monotonic() - started >= budget_seconds:
+            out_of_time = True
+            deferred += len(closed) - index
+            break
         if position.pair in abandoned:
             skipped += 1
             continue
@@ -167,6 +175,7 @@ def enrich_mae_mfe(
     log_event(
         logger, "info", "enrich.completed",
         positions=len(closed), enriched=enriched, rejected=rejected, skipped=skipped, deferred=deferred,
+        out_of_time=out_of_time, elapsed_s=round(time.monotonic() - started, 1),
         abandoned=sorted(abandoned), already_measured=len(measured),
     )
     return enriched
