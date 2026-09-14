@@ -147,7 +147,12 @@ so these pydantic models keep snake_case attributes but serialize by alias to
 | `*Utc` timestamps | the unsuffixed field minus the server's offset *as it stood then* |
 
 Four tables are stored: accounts, closed positions, open positions and
-transactions. Sync runs are deliberately not one of them — a sync is either in
+transactions. They are written in bulk — `INSERT … ON CONFLICT` a thousand
+rows at a time from plain dicts, never one ORM object per row: an account with
+232 000 positions took two and a half hours and 4.8 GB to write the ORM way,
+and blocked the event loop for six minutes building the objects. MAE/MFE
+survive an upsert that carries none (`COALESCE(EXCLUDED.mae, mae)`), which is
+what lets enrichment stay incremental. Sync runs are deliberately not one of them — a sync is either in
 flight, and then `/pool/status` knows about it, or finished, and then its
 outcome is on the account (`last_synced_at`, `status`, `consecutive_failures`,
 `last_error`). Every log line of one sync still shares a correlation id, but it

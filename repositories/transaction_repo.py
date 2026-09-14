@@ -5,11 +5,14 @@ from datetime import datetime
 from typing import List, Optional
 
 from sqlalchemy import delete as sa_delete
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from domain import fx
-from domain.models import MT5Transaction, utc_now
+from domain.models import MT5Transaction, new_id, utc_now
+
+_BATCH = 1000
 
 
 def transaction_fingerprint(transaction: fx.Transaction) -> str:
@@ -25,27 +28,23 @@ class TransactionRepository:
     async def upsert_many(self, account_id: str, transactions: List[fx.Transaction]) -> int:
         if not transactions:
             return 0
-        result = await self.session.execute(
-            select(MT5Transaction.fingerprint).where(MT5Transaction.account_id == account_id)
-        )
-        known = set(result.scalars().all())
         now = utc_now()
-        added = 0
+        rows: dict[str, dict] = {}
         for transaction in transactions:
             fingerprint = transaction_fingerprint(transaction)
-            if fingerprint in known:
-                continue
-            known.add(fingerprint)
-            self.session.add(MT5Transaction(
-                account_id=account_id,
-                fingerprint=fingerprint,
-                time=transaction.time,
-                type=transaction.type,
-                amount=transaction.amount,
-                synced_at=now,
-            ))
-            added += 1
-        await self.session.flush()
+            rows.setdefault(fingerprint, {
+                "id": new_id(), "account_id": account_id, "fingerprint": fingerprint,
+                "time": transaction.time, "type": transaction.type, "amount": transaction.amount, "synced_at": now,
+            })
+        added = 0
+        batch = list(rows.values())
+        for start in range(0, len(batch), _BATCH):
+            result = await self.session.execute(
+                pg_insert(MT5Transaction).values(batch[start:start + _BATCH])
+                .on_conflict_do_nothing(index_elements=["account_id", "fingerprint"])
+                .returning(MT5Transaction.fingerprint)
+            )
+            added += len(result.all())
         return added
 
     async def delete_for_account(self, account_id: str) -> None:
