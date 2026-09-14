@@ -748,6 +748,24 @@ position arrives carrying no MAE/MFE, so `PositionRepository` treats an absent
 value as "not recalculated" rather than "cleared" — otherwise the second sync's
 upsert would wipe what the first one measured.
 
+Incremental also means it can be **rationed**. A sync measures at most
+`MT5_API_ENRICH_MAX_POSITIONS_PER_SYNC` (5000) closed positions, newest first,
+and leaves the rest to the syncs that follow — the same mechanism that skips
+what is already measured picks up what was deferred. Without that an account
+with 464 000 deals never got past its first sync: every attempt ran into the
+900 s task timeout inside the enrichment, so nothing was ever written, and the
+next attempt started from zero.
+
+That account also showed what a symbol that cannot serve candles does to a loop
+that asks once per position: `EURUSD.s` answered every `copy_rates_range` with
+`Call failed`, and one sync produced tens of thousands of identical warnings —
+6.8 million lines and 1.7 GB of log over three days. A symbol that fails three
+fetches in a row is now abandoned for the rest of the sync
+(`enrich.symbol.abandoned`, once), its remaining positions are skipped and
+counted, and they are simply retried on the next sync. A failure that means the
+terminal itself is gone is not swallowed either: it propagates, so the worker
+resets the terminal instead of walking every position through a dead pipe.
+
 With that in place the cache is disposable. Each worker drops its own
 instance's price history after every sync it finishes
 (`MT5_API_PRUNE_CACHE_AFTER_SYNC`, on by default); nothing is kept, and what a

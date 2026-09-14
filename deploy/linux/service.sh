@@ -10,7 +10,9 @@
 # all, so Xvfb is its own service that mt5api depends on. A unit for the
 # display that already exists is left alone - another service on the box may
 # own it. The launch command lives in a runner script because systemd strips
-# backslashes out of ExecStart, which mangles every Windows path.
+# backslashes out of ExecStart, which mangles every Windows path. systemd
+# appends to the log itself, so logrotate copytruncates it rather than moving
+# it; one account once wrote 1.7 GB of warnings into it in three days.
 
 set -euo pipefail
 
@@ -35,6 +37,19 @@ esac
 [ -f "$APP_DIR/.env" ] || { echo "no .env at $APP_DIR/.env" >&2; exit 1; }
 
 mkdir -p "$ROOT/bin" "$ROOT/logs"
+
+cat > /etc/logrotate.d/mt5api <<EOF
+$LOG {
+    daily
+    maxsize 200M
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
 
 cat > "$RUNNER" <<EOF
 #!/bin/bash

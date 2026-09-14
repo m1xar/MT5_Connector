@@ -27,6 +27,7 @@ def worker_main(
     log_level: str,
     log_json: bool,
     with_mae_mfe: bool,
+    enrich_limit: int,
     portable: bool,
     history_settle_timeout_seconds: float,
     prune_cache_after_sync: bool,
@@ -62,7 +63,9 @@ def worker_main(
                 break
             if task is None:
                 break
-            connection.send(_run_task(terminal, worker_id, task, with_mae_mfe, history_settle_timeout_seconds))
+            connection.send(
+                _run_task(terminal, worker_id, task, with_mae_mfe, enrich_limit, history_settle_timeout_seconds)
+            )
             if prune_cache_after_sync:
                 try:
                     prune_price_cache(terminal_path)
@@ -78,6 +81,7 @@ def _run_task(
     worker_id: str,
     task: SyncTask,
     with_mae_mfe: bool,
+    enrich_limit: int,
     history_settle_timeout_seconds: float,
 ) -> SyncResult:
     started = time.perf_counter()
@@ -95,6 +99,7 @@ def _run_task(
                 payload.positions,
                 lambda symbol, interval, start, end: fetch_candles(terminal, symbol, interval, start, end),
                 already_measured=task.already_measured,
+                limit=enrich_limit,
             )
     except TerminalError as exc:
         if exc.terminal_lost:

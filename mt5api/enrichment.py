@@ -9,6 +9,7 @@ from utils.logging import log_event
 
 from .numbers import round8
 from .raw import RawCandle
+from .terminal import TerminalError
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,7 @@ DAY = "1d"
 _MIN_SPAN_FOR_DAILY = timedelta(days=2)
 _TICK = timedelta(microseconds=1)
 _OVERLAP_TOLERANCE = 0.01
+_SYMBOL_FAILURE_LIMIT = 3
 
 
 def _value_per_price_unit(position: fx.FXPosition) -> float | None:
@@ -105,7 +107,10 @@ def _segments(start: datetime, end: datetime) -> list[tuple[str, datetime, datet
 
 
 def enrich_mae_mfe(
-    positions: Iterable[fx.FXPosition], fetch: CandleFetcher, already_measured: Collection[str] = ()
+    positions: Iterable[fx.FXPosition],
+    fetch: CandleFetcher,
+    already_measured: Collection[str] = (),
+    limit: int | None = None,
 ) -> int:
     everything = list(positions)
     measured = set(already_measured)
@@ -116,20 +121,40 @@ def enrich_mae_mfe(
     if not closed:
         log_event(logger, "info", "enrich.skipped", already_measured=len(measured))
         return 0
+    closed.sort(key=lambda p: p.closed_at, reverse=True)
+    deferred = 0
+    if limit is not None and len(closed) > limit:
+        deferred, closed = len(closed) - limit, closed[:limit]
 
     per_lot = value_per_lot(everything)
-    enriched = rejected = 0
+    enriched = rejected = skipped = 0
+    failures: dict[str, int] = {}
+    abandoned: set[str] = set()
     for position in closed:
+        if position.pair in abandoned:
+            skipped += 1
+            continue
         try:
             candles: list[RawCandle] = []
             for interval, start, end in _segments(position.created_at, position.closed_at):
                 candles.extend(fetch(position.pair, interval, start, end))
         except Exception as exc:
-            log_event(
-                logger, "warning", "enrich.candles.failed",
-                pair=position.pair, position_id=position.id, error=str(exc),
-            )
+            if isinstance(exc, TerminalError) and exc.terminal_lost:
+                raise
+            failures[position.pair] = failures.get(position.pair, 0) + 1
+            if failures[position.pair] >= _SYMBOL_FAILURE_LIMIT:
+                abandoned.add(position.pair)
+                log_event(
+                    logger, "warning", "enrich.symbol.abandoned",
+                    pair=position.pair, failures=failures[position.pair], error=str(exc),
+                )
+            else:
+                log_event(
+                    logger, "warning", "enrich.candles.failed",
+                    pair=position.pair, position_id=position.id, error=str(exc),
+                )
             continue
+        failures.pop(position.pair, None)
         if not candles:
             continue
         high = max(c.high for c in candles)
@@ -141,6 +166,7 @@ def enrich_mae_mfe(
 
     log_event(
         logger, "info", "enrich.completed",
-        positions=len(closed), enriched=enriched, rejected=rejected, already_measured=len(measured),
+        positions=len(closed), enriched=enriched, rejected=rejected, skipped=skipped, deferred=deferred,
+        abandoned=sorted(abandoned), already_measured=len(measured),
     )
     return enriched

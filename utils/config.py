@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     account_error_threshold: int = 3
     worker_start_timeout_seconds: float = 120.0
     enrich_mae_mfe: bool = True
+    enrich_max_positions_per_sync: int = 5000
 
     api_token: str = ""
     api_host: str = "0.0.0.0"

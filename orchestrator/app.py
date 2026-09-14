@@ -55,6 +55,7 @@ async def lifespan(app: FastAPI):
         log_level=settings.log_level,
         log_json=settings.log_json,
         enrich_mae_mfe=settings.enrich_mae_mfe,
+        enrich_max_positions_per_sync=settings.enrich_max_positions_per_sync,
         proxies=proxies,
         proxy_registry=proxy_registry,
         proxy_probe_timeout_seconds=settings.proxy_probe_timeout_seconds,
