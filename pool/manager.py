@@ -10,7 +10,7 @@ from typing import Awaitable, Callable
 
 from domain.enums import SyncKind
 from mt5api.proxy import Proxy
-from mt5api.terminal import AUTHORIZATION_FAILED, StartGate
+from mt5api.terminal import AUTHORIZATION_FAILED, StartGate, is_ipc
 from services.proxy_service import ProxyRegistry
 from utils.logging import log_event
 
@@ -371,7 +371,9 @@ class PoolManager:
     def _should_retry(self, item: _QueuedTask, result: SyncResult) -> bool:
         if result.ok:
             return False
-        if result.error_code == AUTHORIZATION_FAILED:
+        if result.error_code == AUTHORIZATION_FAILED or (
+            is_ipc(result.error_code) and not result.terminal_lost and not result.proxy_dead
+        ):
             log_event(logger, "info", "pool.task.not_retrying", account_id=item.task.account_id, error_code=result.error_code)
             return False
         if result.proxy_dead and item.proxy_rotations == 0:

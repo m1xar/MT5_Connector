@@ -339,7 +339,10 @@ has never synced has `last_synced_at IS NULL`, so it is due on every single
 tick, and one wrong server name would otherwise re-queue itself every 60 s and
 occupy its terminal for ~100 s a time. They come back on an explicit
 `POST /accounts/{id}/sync`, or as soon as `PATCH /accounts/{id}` supplies a new
-password — new credentials clear the strikes and restore `active`.
+password — new credentials clear the strikes and restore `active`. A PATCH that
+repeats the password it already has changes nothing: there is nothing new to
+prove, and a nightly "re-check everything" that PATCHed seven accounts with
+misspelt server names was costing nine 30 s logins per account per day.
 
 Not every `error_connection` is ours to fix. `Authorization failed` (`-6`)
 means the broker refused the credentials; `Invalid account` is the same refusal
@@ -412,7 +415,10 @@ hard sync on a dead terminal times out with 504 while its task stays queued.
 **Losing a terminal costs one retry, on the same terminal.** An IPC failure is
 followed by a `terminal_info()` probe; no answer restarts the worker process
 in place and the task is retried on it, spending one of its retries
-(`MT5_API_MAX_TASK_RETRIES`). An initial sync has none and fails instead.
+(`MT5_API_MAX_TASK_RETRIES`). An initial sync has none and fails instead. An
+IPC failure the probe *does* answer — the terminal is fine, the server never
+replied — is not retried at all, like a `-6`: a week of logs holds no retry of
+one that ever succeeded, and each costs the terminal another 30 s.
 
 **Failing to spawn is a normal outcome**, not an exception — the restart ladder
 has to keep its footing whether the process would not start or would not

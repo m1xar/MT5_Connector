@@ -43,7 +43,7 @@ class AccountService:
     async def update(
         self, account: MT5Account, *, password: str | None = None, enabled: bool | None = None
     ) -> MT5Account:
-        if password is not None:
+        if password is not None and password != account.password:
             account.password = password
             account.status = AccountStatus.active
             account.consecutive_failures = 0
