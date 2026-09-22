@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     terminal_paths: str = ""
     terminal_portable: bool = False
+    master_terminal_path: str = ""
     terminal_init_timeout_ms: int = 30000
     terminal_login_timeout_ms: int = 30000
     terminal_initial_connect_timeout_ms: int = 120000
@@ -49,6 +50,15 @@ class Settings(BaseSettings):
     def terminals(self) -> list[str]:
         raw = self.terminal_paths.replace("\n", ";")
         return [part.strip() for part in raw.split(";") if part.strip()]
+
+    @property
+    def master_terminal(self) -> str | None:
+        if self.master_terminal_path:
+            return self.master_terminal_path
+        if not self.terminals:
+            return None
+        first = Path(self.terminals[0])
+        return str(first.parent.parent / "master" / first.name)
 
     def problems(self) -> list[str]:
         issues: list[str] = []

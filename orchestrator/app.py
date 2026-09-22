@@ -62,6 +62,7 @@ async def lifespan(app: FastAPI):
         proxy_probe_timeout_seconds=settings.proxy_probe_timeout_seconds,
         proxy_recheck_minutes=settings.proxy_recheck_minutes,
         cold_start_timeout_ms=settings.terminal_initial_connect_timeout_ms,
+        master_terminal_path=settings.master_terminal,
     )
     sync_service = SyncService(terminal_pool)
     terminal_pool.on_result = sync_service.persist

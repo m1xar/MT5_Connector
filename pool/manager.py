@@ -15,7 +15,7 @@ from services.proxy_service import ProxyRegistry
 from utils.logging import log_event
 from utils.procs import kill_stale_updaters
 
-from .health import HealthBoard, TerminalState
+from .health import HealthBoard, PoolInspection, TerminalState, inspect
 from .protocol import PRIORITY_HARD, PRIORITY_SCHEDULED, SyncResult, SyncTask, WorkerState
 from .worker import worker_main
 from .worker_handle import WorkerHandle
@@ -71,8 +71,10 @@ class PoolManager:
         proxy_probe_timeout_seconds: float = 10.0,
         proxy_recheck_minutes: int = 60,
         cold_start_timeout_ms: int = 120000,
+        master_terminal_path: str | None = None,
     ) -> None:
         self.terminal_paths = terminal_paths
+        self.master_terminal_path = master_terminal_path
         self._proxies = proxies
         self._proxy_registry = proxy_registry
         self._proxy_recheck_seconds = proxy_recheck_minutes * 60.0
@@ -225,6 +227,12 @@ class PoolManager:
     def queue_depth_for(self, terminal_path: str) -> int:
         return self._workers[terminal_path].queue_depth
 
+    async def inspect(self) -> PoolInspection:
+        return await asyncio.to_thread(inspect, self.health, self.master_terminal_path)
+
+    def worker_for(self, terminal_path: str) -> WorkerHandle:
+        return self._workers[terminal_path]
+
     @property
     def placeable_terminals(self) -> list[str]:
         return self.health.placeable()
@@ -286,7 +294,9 @@ class PoolManager:
                     self._reproxy_due = asyncio.get_running_loop().time() + self._proxy_recheck_seconds
                     await self._reproxy_idle()
                 for pid, path in await asyncio.to_thread(kill_stale_updaters, _UPDATER_MAX_AGE_SECONDS):
+                    self.health.tally.liveupdate_killed += 1
                     log_event(logger, "warning", "pool.terminal.liveupdate_killed", pid=pid, path=path)
+                await asyncio.to_thread(self.health.refresh_builds)
                 failed = [
                     worker for worker in self._workers.values()
                     if worker.state is WorkerState.failed and self.health.terminals[worker.terminal_path].usable

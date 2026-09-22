@@ -5,7 +5,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from pool.manager import PoolManager
 from repositories.account_repo import AccountRepository
-from schemas.pool import HealthResponse, PoolStatusResponse, pool_status_to_response
+from schemas.pool import (
+    HealthResponse,
+    PoolHealthResponse,
+    PoolStatusResponse,
+    pool_health_to_response,
+    pool_status_to_response,
+)
 
 from ..deps import COMMON_RESPONSES, get_pool, get_session, verify_auth
 
@@ -28,6 +34,36 @@ async def get_pool_status(
 
 
 @router.get(
+    "/pool/health",
+    response_model=PoolHealthResponse,
+    summary="Terminal health",
+    description=(
+        "What the pool knows about each terminal beyond its worker: the state of "
+        "the health board (healthy, suspect, quarantined, recloning), the build "
+        "it runs against the quorum of the pool, the process the worker launched "
+        "and whether that is the one still running, and a list of problems in "
+        "plain words. `problems` at the top level covers the pool as a whole."
+    ),
+    responses={401: COMMON_RESPONSES[401]},
+    dependencies=[Depends(verify_auth)],
+)
+async def get_pool_health(
+    terminal_pool: PoolManager = Depends(get_pool), session: AsyncSession = Depends(get_session)
+):
+    assigned = await AccountRepository(session).counts_by_terminal()
+    inspection = await terminal_pool.inspect()
+    return pool_health_to_response(terminal_pool, inspection, assigned, _overall(terminal_pool))
+
+
+def _overall(pool: PoolManager) -> str:
+    if not pool.dispatcher_alive:
+        return "stalled"
+    if pool.healthy_workers == len(pool.terminal_paths):
+        return "ok"
+    return "degraded"
+
+
+@router.get(
     "/healthz",
     response_model=HealthResponse,
     summary="Liveness",
@@ -41,12 +77,6 @@ async def healthz(request: Request):
     pool: PoolManager | None = getattr(request.app.state, "pool", None)
     if pool is None:
         return HealthResponse(status="starting", healthy_workers=0, worker_count=0)
-    worker_count = len(pool.terminal_paths)
-    healthy = pool.healthy_workers
-    if not pool.dispatcher_alive:
-        status = "stalled"
-    elif healthy == worker_count:
-        status = "ok"
-    else:
-        status = "degraded"
-    return HealthResponse(status=status, healthy_workers=healthy, worker_count=worker_count)
+    return HealthResponse(
+        status=_overall(pool), healthy_workers=pool.healthy_workers, worker_count=len(pool.terminal_paths)
+    )

@@ -8,6 +8,9 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
+from mt5api.proxy import Marker, read_marker
+from utils.procs import pids_of, started_at, updater_pids
+
 from .protocol import SyncResult
 
 _SUSPECT_STRIKES = 2
@@ -224,3 +227,34 @@ def build_of(exe_path: str, known: str | None, known_stat: tuple[int, float] | N
     except OSError:
         return None, None
     return digest.hexdigest(), current
+
+
+@dataclass(slots=True)
+class TerminalInspection:
+    health: TerminalHealth
+    pids: list[int]
+    marker: Marker | None
+    launched_at: datetime | None
+
+
+@dataclass(slots=True)
+class PoolInspection:
+    terminals: list[TerminalInspection]
+    quorum: tuple[str, str] | None
+    master_build: str | None
+    updaters: list[tuple[int, float]]
+
+
+def inspect(board: HealthBoard, master_path: str | None) -> PoolInspection:
+    board.refresh_builds()
+    terminals = []
+    for health in board.snapshot():
+        marker = read_marker(health.terminal_path)
+        pids = pids_of(health.terminal_path)
+        launched = started_at(marker.pid) if marker and marker.pid in pids else None
+        terminals.append(TerminalInspection(
+            health, pids, marker, datetime.fromtimestamp(launched, timezone.utc) if launched else None,
+        ))
+    master_build = build_of(master_path, None, None)[0] if master_path else None
+    updaters = [(pid, time.time() - (started_at(pid) or time.time())) for pid, _ in updater_pids()]
+    return PoolInspection(terminals, board.quorum(), master_build, updaters)
