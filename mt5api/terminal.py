@@ -106,6 +106,7 @@ class MT5Terminal:
         self._mt5: Any | None = None
         self._current_login: tuple[int, str, str] | None = None
         self._attach_failures = 0
+        self._replaced = False
         self.report: StartReport | None = None
 
     def take_report(self) -> StartReport | None:
@@ -122,6 +123,7 @@ class MT5Terminal:
         if self._mt5 is not None and self.managed and not self._bound_alive():
             log_event(logger, "warning", "terminal.replaced", path=self.path, pids=pids_of(self.path))
             self.shutdown()
+            self._replaced = True
         if self._mt5 is not None:
             if self._current_login != (login, password, server):
                 self._login(login, password, server, timeout_ms or self.login_timeout_ms)
@@ -182,7 +184,8 @@ class MT5Terminal:
             report.died = True
 
     def _prepare(self, login: int, password: str, server: str) -> bool:
-        report = self.report = StartReport()
+        report = self.report = StartReport(replaced=self._replaced)
+        self._replaced = False
         wanted = marker_for(self.proxy)
         running = pids_of(self.path)
         if running:
