@@ -56,19 +56,26 @@ untouched accounts synced through the same terminals in 3–5 s. The pool used t
 hand every sync to whichever worker was idle, so one account visited twelve
 terminals a day.
 
-Now an account is **pinned to one terminal for life**:
+Now an account is **pinned to one terminal**, and stays there as long as that
+terminal works:
 
-* On `POST /accounts` the terminal with the fewest *active* accounts is chosen
-  — active means `enabled` and not `error_connection`, the same filter the
-  scheduler uses — ties broken by the order in `MT5_API_TERMINAL_PATHS`. The
-  choice is stored on the row as `terminal_path` and reported as `terminal`.
+* On `POST /accounts` the *healthy* terminal with the fewest *active* accounts
+  is chosen — active means `enabled` and not `error_connection`, the same
+  filter the scheduler uses; healthy is the health board's word (see *Terminal
+  health*) — ties broken by the order in `MT5_API_TERMINAL_PATHS`. The choice
+  is stored on the row as `terminal_path` and reported as `terminal`. Before
+  health was part of the pick, one terminal whose binary had been corrupted by
+  an update collected every account registered that day: all of its accounts
+  were failing, so it always had the fewest active ones.
 * Every sync of that account, initial, hard or scheduled, is queued on that
   terminal's own queue and runs on that worker only. A task never moves to
-  another terminal, not on failure, not on restart.
+  another terminal on failure or restart.
 * The pin is the path string from `MT5_API_TERMINAL_PATHS`. Renaming, reordering
-  or removing a path orphans its accounts; an orphan is re-pinned to the
-  least-loaded remaining terminal on its next sync (`account.terminal.assigned`
-  in the log, `previous` set).
+  or removing a path orphans its accounts, and quarantining a terminal orphans
+  its accounts the same way; an orphan is re-pinned to the least-loaded healthy
+  terminal on its next sync (`account.terminal.assigned` in the log, `previous`
+  set). Nothing moves back afterwards: the recloned terminal fills up again
+  from new registrations, which is exactly where the fewest accounts are.
 * `GET /pool/status` shows `assigned_accounts` per worker — active accounts
   only, so an `error_connection` account frees its slot for the next
   registration.
@@ -109,10 +116,16 @@ longer on it gets another, unassigned one. `GET /pool/status` shows `proxy`
 per worker.
 
 Because the worker launches the terminal itself, it also owns it: before a
-cold start it checks what is running on its path and what that instance was
-launched with (`config/mt5api-proxy.txt`), attaches if they agree, and
-otherwise kills the instance and launches afresh. Under Wine a killed
-terminal is just a process; nothing else is touched.
+cold start it checks what is running on its path against
+`config/mt5api-proxy.txt`, which records the proxy *and the pid* of the
+instance the worker launched. It attaches only to that pid; any other
+instance is killed and the terminal launched afresh. The pid matters because
+MetaQuotes' LiveUpdate relaunches a terminal itself, with `/skipupdate` and
+without our `/config`, and such an instance runs without the proxy — four
+terminals spent twelve hours talking to their brokers from the box's own
+address while the marker still named a proxy. `GET /pool/health` shows the
+bound pid and whether it is the one alive. Under Wine a killed terminal is
+just a process; nothing else is touched.
 
 **When a proxy dies.** Every IPC failure on a proxied terminal is followed by
 a probe through the proxy — a `CONNECT` to Webshare's own IP echo. If it
@@ -249,10 +262,13 @@ pool/
   worker_handle.py  one worker process: spawn, pipe, restart ladder, its queue and counters
   worker.py         runs inside the child; one terminal, one task at a time
   protocol.py       what crosses the pipe: SyncTask, SyncResult, WorkerState
+  health.py         the health board: strikes per terminal, quarantine, the quorum build, inspection
+  reclone.py        a quarantined terminal rebuilt from the master
 
 mt5api/
   terminal.py       the only module that imports MetaTrader5; start gate, probe, launching behind a proxy
-  proxy.py          the proxy, the start-up ini and marker the terminal is launched with, the probe
+  proxy.py          the proxy, the start-up ini and the pid-bound marker the terminal is launched with, the probe
+  report.py         StartReport: what a cold start did, as the worker saw it
   fetch.py          every read off a terminal: account, deals, orders, candles, clock cache
   clock.py          the server's UTC offset per switch, read off the trading week
   enrichment.py     money factors, RR, MAE/MFE
@@ -267,7 +283,7 @@ domain/             fx.py (canonical models and SyncPayload), models.py (tables)
 repositories/       queries and flush, no commits
 services/           transaction boundaries: account, sync (with the scheduler), query;
                     terminal_affinity picks and stores the pin; proxy_service talks to Webshare
-utils/              config, logging, procs (finding and killing a terminal by path)
+utils/              config, logging, alerts (Telegram), procs (finding and killing a terminal by path or age)
 
 deploy/             Windows: open-master, clone, prune-history
 deploy/linux/       install, make-master, clone-pool, service, verify-pool, docker-compose
@@ -286,6 +302,7 @@ deploy/linux/       install, make-master, clone-pool, service, verify-pool, dock
 | GET | `/accounts/{id}/balance-snapshots?days=N` | derived on read |
 | GET | `/accounts/{id}/transactions?days=N` | deposits/withdrawals |
 | GET | `/pool/status` | per worker: state, pid, proxy, its queue depth, accounts pinned to it, counters; pool totals |
+| GET | `/pool/health` | per terminal: health state, build against the quorum, the launched pid and whether it is alive, problems in words |
 | GET | `/healthz` | public liveness: `ok`, `degraded`, `stalled` |
 
 `days=0` means "everything". `/healthz` reports `degraded` when a terminal is
@@ -411,6 +428,9 @@ marked failed. A failed worker's queue keeps its tasks and waits: the reaper
 tries a restart, and the tasks run on that terminal when it is back. They are
 never handed to another terminal — that is the whole point of the pin — so a
 hard sync on a dead terminal times out with 504 while its task stays queued.
+The one exception is a quarantine (see *Terminal health*): the queue is
+answered at once with `terminal quarantined`, no account collects a strike,
+and each account is re-pinned when it is next asked for.
 
 **Losing a terminal costs one retry, on the same terminal.** An IPC failure is
 followed by a `terminal_info()` probe; no answer restarts the worker process
@@ -430,6 +450,75 @@ and a sync that was in flight at that moment is resolved as "pool is shutting
 down" without touching the account — a service restart is not an account
 failure. Queued tasks are failed the same way; a submit that arrives after the
 pool has closed is answered immediately.
+
+## Terminal health
+
+A terminal can be broken in a way no login result shows. On 2026-09-22 a
+LiveUpdate left one clone with a `terminal64.exe` of the right size and the
+wrong bytes: every start exited within a second, the worker attached to the
+zombie the last start had left, waited out the connect timeout, restarted,
+attached again — 215 failed tasks, none completed, and nothing escalated,
+because every failure looked like an account that could not log in. The
+health board exists to tell those apart.
+
+**Strikes come from cold starts, never from logins.** The worker reports what
+happened when it started or attached to the terminal (`StartReport` on the
+result): whether it launched a process and whether that process was still
+there three seconds later, whether it attached and `initialize()` answered.
+
+| signal | strike | why it cannot be the broker |
+|---|---|---|
+| the launched process is gone within seconds, or `Popen` refused it | hard | a slow start does not exit; a broker outage does not kill a process |
+| an attached instance failed `initialize()` twice running and was killed | hard | a live terminal that cannot reach one server still answers the next account |
+| `initialize()` never answered, process alive, fresh launch | soft | ambiguous: unknown server, cold start under load, broker down |
+| the launched pid was replaced by another instance (LiveUpdate) | none | it is killed and relaunched with our config; counted for the digest |
+
+Two strikes make the terminal `suspect`: new accounts avoid it, nothing else
+changes, and one successful start clears it. Three strikes with two of them
+hard, or five soft ones spread over at least two servers and fifteen
+minutes, **quarantine** it. Soft strikes are ignored while the pool is
+warming up (the worker start window plus the cold-start timeout), when
+sixteen terminals starting at once take longer than any timeout; hard ones
+count at any hour.
+
+**Quarantine** stops the worker, answers everything in its queue as
+`terminal quarantined` without a strike on any account, sends a Telegram
+message, and takes the terminal out of every pick: accounts pinned to it are
+re-pinned on their next sync, a registration that hit it is queued once more
+on a healthy terminal. The reaper skips it.
+
+**Reclone.** Once an hour at most per terminal, the reaper takes one
+quarantined terminal, kills whatever is left of it, moves the folder aside as
+`tN.broken-<stamp>` (one such copy is kept per terminal), copies the master
+without its caches and credentials — the same list `clone-pool.sh` uses —
+and restarts the worker. If the master is behind the build most healthy
+terminals run (the *quorum*, an md5 over `terminal64.exe`), the three
+executables are copied from a quorum terminal instead, and the pool says so
+once a day: the real fix is `make-master.sh` from a healthy terminal. The
+broken terminal's `servers.dat` is carried across if it had grown, since a
+terminal learns brokers as it logs in. `MT5_API_TERMINAL_RECLONE=false`
+leaves quarantined terminals for a person; `MT5_API_MASTER_TERMINAL_PATH`
+names the master, defaulting to `master\terminal64.exe` beside the clones.
+
+**Hung updaters.** LiveUpdate runs a copy of the terminal from `%APPDATA%`
+to apply an update; one of those hung for twelve hours. The reaper kills any
+older than ten minutes.
+
+**Alerts.** `MT5_API_TELEGRAM_BOT_TOKEN` and `MT5_API_TELEGRAM_CHAT_ID`
+together turn on a Telegram bot. It reports a start-up with the host's
+uptime — so a reboot or a restart nobody asked for is a message, not a log
+line —, every quarantine, every reclone and its failure, a master behind the
+pool, and a daily digest at `MT5_API_ALERT_DIGEST_HOUR_UTC` with the day's
+syncs, quarantines, reclones, LiveUpdate relaunches and hung updaters
+killed. An identical message is not repeated within ten minutes.
+
+**The host must not restart the service on its own.** The one unplanned
+restart in the first week was Ubuntu's `unattended-upgrades`: `needrestart`
+restarted `xvfb.service` after a library update, and the service, which
+`Requires` the display, went down with it — twice, each time past the stop
+timeout, and each restart triggered the pending LiveUpdate on every
+terminal that had one waiting. `service.sh install` disables the apt timers
+and tells `needrestart` to leave both units alone.
 
 **Threads are sized to the pool.** Every in-flight sync parks one thread in a
 blocking pipe read for its whole duration, up to the task timeout. The default

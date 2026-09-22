@@ -13,6 +13,10 @@
 # backslashes out of ExecStart, which mangles every Windows path. systemd
 # appends to the log itself, so logrotate copytruncates it rather than moving
 # it; one account once wrote 1.7 GB of warnings into it in three days.
+#
+# The host's own upgrades are switched off here. unattended-upgrades once
+# had needrestart bounce xvfb after a glib update, which took the service
+# down with it and set off a pending terminal update on every clone.
 
 set -euo pipefail
 
@@ -90,12 +94,25 @@ WorkingDirectory=$APP_DIR
 ExecStart=$RUNNER
 Restart=always
 RestartSec=10
+TimeoutStopSec=120
+KillMode=mixed
 StandardOutput=append:$LOG
 StandardError=append:$LOG
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+mkdir -p /etc/needrestart/conf.d
+cat > /etc/needrestart/conf.d/mt5api.conf <<'EOF'
+$nrconf{override_rc}{qr(^xvfb)} = 0;
+$nrconf{override_rc}{qr(^mt5api)} = 0;
+EOF
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Unattended-Upgrade "0";
+EOF
+systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 
 systemctl daemon-reload
 systemctl enable --now xvfb
