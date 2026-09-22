@@ -46,6 +46,7 @@ class _QueuedTask:
     max_retries: int | None
     attempts: int = 0
     proxy_rotations: int = 0
+    replacements: int = 0
 
 
 @dataclass(slots=True)
@@ -596,6 +597,11 @@ class PoolManager:
         ):
             log_event(logger, "info", "pool.task.not_retrying", account_id=item.task.account_id, error_code=result.error_code)
             return False
+        if result.terminal is not None and result.terminal.replaced and item.replacements == 0:
+            item.replacements += 1
+            item.attempts -= 1
+            log_event(logger, "info", "pool.task.retrying_after_replacement", account_id=item.task.account_id)
+            return True
         if result.proxy_dead and item.proxy_rotations == 0:
             item.proxy_rotations += 1
             item.attempts -= 1

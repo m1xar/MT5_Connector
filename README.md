@@ -123,9 +123,13 @@ instance is killed and the terminal launched afresh. The pid matters because
 MetaQuotes' LiveUpdate relaunches a terminal itself, with `/skipupdate` and
 without our `/config`, and such an instance runs without the proxy — four
 terminals spent twelve hours talking to their brokers from the box's own
-address while the marker still named a proxy. `GET /pool/health` shows the
-bound pid and whether it is the one alive. Under Wine a killed terminal is
-just a process; nothing else is touched.
+address while the marker still named a proxy. The check is not only made on
+a cold start: every `connect()` on a bound worker, and every IPC failure,
+first asks whether the pid it launched is still there; if it is gone the
+worker drops its session, and the task is re-run once without spending a
+retry, so even an initial sync survives a terminal being swapped under it.
+`GET /pool/health` shows the bound pid and whether it is the one alive. Under
+Wine a killed terminal is just a process; nothing else is touched.
 
 **When a proxy dies.** Every IPC failure on a proxied terminal is followed by
 a probe through the proxy — a `CONNECT` to Webshare's own IP echo. If it

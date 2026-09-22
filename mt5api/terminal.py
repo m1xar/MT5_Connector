@@ -119,6 +119,9 @@ class MT5Terminal:
         return self._mt5
 
     def connect(self, login: int, password: str, server: str, *, timeout_ms: int | None = None) -> None:
+        if self._mt5 is not None and self.managed and not self._bound_alive():
+            log_event(logger, "warning", "terminal.replaced", path=self.path, pids=pids_of(self.path))
+            self.shutdown()
         if self._mt5 is not None:
             if self._current_login != (login, password, server):
                 self._login(login, password, server, timeout_ms or self.login_timeout_ms)
@@ -222,6 +225,10 @@ class MT5Terminal:
         log_event(logger, "info", "terminal.launched", path=self.path, proxy=wanted, pid=process.pid)
         return True
 
+    def _bound_alive(self) -> bool:
+        marker = read_marker(self.path)
+        return marker is not None and marker.pid in pids_of(self.path)
+
     def _attach_blocker(self, running: list[int], marker: Marker | None, wanted: str) -> str | None:
         if marker is None or marker.proxy != wanted:
             return "proxy_mismatch"
@@ -245,7 +252,13 @@ class MT5Terminal:
     def failure(self, message: str, code: int | None) -> TerminalError:
         lost = False
         proxy_dead = False
-        if is_ipc(code) and self._mt5 is not None:
+        if is_ipc(code) and self.managed and not self._bound_alive():
+            self.report = self.report or StartReport()
+            self.report.replaced = True
+            lost = True
+            message = f"{message} - the terminal the worker launched is gone"
+            log_event(logger, "warning", "terminal.replaced", path=self.path, pids=pids_of(self.path), error_code=code)
+        elif is_ipc(code) and self._mt5 is not None:
             lost = self._mt5.terminal_info() is None
             log_event(logger, "warning", "terminal.probe", path=self.path, error_code=code, terminal_lost=lost)
         if is_ipc(code) and self.proxy is not None:
