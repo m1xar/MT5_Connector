@@ -19,7 +19,7 @@ from utils.procs import kill_stale_updaters
 
 from .health import HealthBoard, PoolInspection, TerminalState, build_of, inspect
 from .protocol import PRIORITY_HARD, PRIORITY_SCHEDULED, SyncResult, SyncTask, WorkerState
-from .reclone import reclone_terminal
+from .reclone import promote_master, reclone_terminal
 from .worker import worker_main
 from .worker_handle import WorkerHandle
 
@@ -94,6 +94,7 @@ class PoolManager:
         self._reclone_interval = reclone_min_interval_minutes * 60.0
         self._reclone_lock = asyncio.Lock()
         self._master_behind_on: datetime.date | None = None
+        self._master_refreshed_on: datetime.date | None = None
         self._proxies = proxies
         self._proxy_registry = proxy_registry
         self._proxy_recheck_seconds = proxy_recheck_minutes * 60.0
@@ -318,6 +319,7 @@ class PoolManager:
                 await asyncio.to_thread(self.health.refresh_builds)
                 self._maybe_digest()
                 await self._maybe_reclone()
+                await self._maybe_refresh_master()
                 failed = [
                     worker for worker in self._workers.values()
                     if worker.state is WorkerState.failed and self.health.terminals[worker.terminal_path].usable
@@ -484,9 +486,47 @@ class PoolManager:
             else:
                 self.health.mark_reclone_failed(path, "worker did not start after the reclone")
                 self._alert(f"Terminal {_short(path)} was recloned but its worker did not start; it stays quarantined.")
-            master_build = await asyncio.to_thread(lambda: build_of(self.master_terminal_path, None, None)[0])
-            if quorum and master_build and master_build != quorum[0]:
-                self._master_behind()
+
+    async def _maybe_refresh_master(self) -> None:
+        if not self._reclone or not self.master_terminal_path or self._closing or self._reclone_lock.locked():
+            return
+        quorum = self.health.quorum()
+        if quorum is None:
+            return
+        master_build = await asyncio.to_thread(lambda: build_of(self.master_terminal_path, None, None)[0])
+        if master_build == quorum[0]:
+            return
+        today = datetime.now(timezone.utc).date()
+        if self._master_refreshed_on == today:
+            self._master_behind()
+            return
+        source = next(
+            (
+                worker for worker in self._workers.values()
+                if worker.state is WorkerState.idle
+                and self.health.terminals[worker.terminal_path].state is TerminalState.healthy
+                and self.health.terminals[worker.terminal_path].build == quorum[0]
+            ),
+            None,
+        )
+        if source is None:
+            return
+        async with self._reclone_lock:
+            source.state = WorkerState.restarting
+            source.ready.clear()
+            try:
+                build = await asyncio.to_thread(promote_master, source.terminal_path, self.master_terminal_path)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                self._master_refreshed_on = today
+                log_event(logger, "error", "pool.master.refresh_failed", source=source.terminal_path, error=error)
+                self._alert(f"The master could not be refreshed from {_short(source.terminal_path)}: {error}")
+                return
+            finally:
+                source.mark_idle()
+        self._master_refreshed_on = today
+        log_event(logger, "warning", "pool.master.refreshed", source=source.terminal_path, build=build, previous=master_build)
+        self._alert(f"Master refreshed from {_short(source.terminal_path)} to build {build[:12] if build else '?'}.")
 
     def _master_behind(self) -> None:
         today = datetime.now(timezone.utc).date()

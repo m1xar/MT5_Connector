@@ -23,6 +23,10 @@ class RecloneError(RuntimeError):
     pass
 
 
+class PromoteError(RuntimeError):
+    pass
+
+
 @dataclass(slots=True)
 class RecloneReport:
     broken_dir: str
@@ -101,3 +105,22 @@ def _servers_dat(root: Path) -> Path | None:
         if config.is_dir() and config.name.lower() == "config":
             return config / "servers.dat"
     return None
+
+
+def promote_master(source_path: str, master_path: str) -> str | None:
+    source_dir = Path(source_path).parent
+    master_dir = Path(master_path).parent
+    stage = master_dir.with_name(f"{master_dir.name}.staging")
+    shutil.rmtree(stage, ignore_errors=True)
+    shutil.copytree(source_dir, stage, ignore=_ignored_in(source_dir))
+    (stage / "Bases").mkdir(exist_ok=True)
+    if any(path.name.lower() == "accounts.dat" for path in stage.rglob("*")):
+        shutil.rmtree(stage, ignore_errors=True)
+        raise PromoteError("the staged master still carries accounts.dat")
+    if master_dir.exists():
+        for old in master_dir.parent.glob(f"{master_dir.name}.replaced-*"):
+            shutil.rmtree(old, ignore_errors=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        os.rename(master_dir, master_dir.with_name(f"{master_dir.name}.replaced-{stamp}"))
+    os.rename(stage, master_dir)
+    return build_of(master_path, None, None)[0]

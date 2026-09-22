@@ -491,12 +491,20 @@ on a healthy terminal. The reaper skips it.
 quarantined terminal, kills whatever is left of it, moves the folder aside as
 `tN.broken-<stamp>` (one such copy is kept per terminal), copies the master
 without its caches and credentials — the same list `clone-pool.sh` uses —
-and restarts the worker. If the master is behind the build most healthy
-terminals run (the *quorum*, an md5 over `terminal64.exe`), the three
-executables are copied from a quorum terminal instead, and the pool says so
-once a day: the real fix is `make-master.sh` from a healthy terminal. The
-broken terminal's `servers.dat` is carried across if it had grown, since a
-terminal learns brokers as it logs in. `MT5_API_TERMINAL_RECLONE=false`
+and restarts the worker. The broken terminal's `servers.dat` is carried
+across if it had grown, since a terminal learns brokers as it logs in.
+
+**The master follows the pool.** LiveUpdate moves the terminals on, one
+restart at a time, and a master left behind would hand every reclone the
+same update to download. So once a minute the reaper compares the master's
+`terminal64.exe` with the *quorum* — the md5 most healthy terminals share —
+and when they differ it promotes an idle quorum terminal the way
+`make-master.sh` does: a copy without caches, logs and credentials, checked
+for `accounts.dat`, swapped in with the previous master kept as
+`master.replaced-<stamp>`. The worker of the source terminal is held for the
+seconds the copy takes. At most once a day; a reclone that runs before the
+refresh lays the quorum executables over the clone instead, and a refresh
+that fails is reported and left for `make-master.sh`. `MT5_API_TERMINAL_RECLONE=false`
 leaves quarantined terminals for a person; `MT5_API_MASTER_TERMINAL_PATH`
 names the master, defaulting to `master\terminal64.exe` beside the clones.
 
