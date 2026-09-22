@@ -49,3 +49,4 @@ class SyncResult:
     history_withheld: bool = False
     proxy_dead: bool = False
     terminal: StartReport | None = None
+    quarantined: bool = False

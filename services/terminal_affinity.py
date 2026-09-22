@@ -16,12 +16,14 @@ def pick_terminal(terminal_paths: Sequence[str], counts: Mapping[str, int]) -> s
     return min(terminal_paths, key=lambda path: counts.get(path, 0))
 
 
-async def ensure_assigned(session: AsyncSession, account: MT5Account, terminal_paths: Sequence[str]) -> str:
-    if account.terminal_path in terminal_paths:
+async def ensure_assigned(
+    session: AsyncSession, account: MT5Account, keep: Sequence[str], place: Sequence[str]
+) -> str:
+    if account.terminal_path in keep:
         return account.terminal_path
     repo = AccountRepository(session)
     previous = account.terminal_path
-    account.terminal_path = pick_terminal(terminal_paths, await repo.counts_by_terminal())
+    account.terminal_path = pick_terminal(place, await repo.counts_by_terminal())
     await repo.update(account)
     await session.commit()
     log_event(

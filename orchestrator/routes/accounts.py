@@ -68,20 +68,15 @@ async def create_account(
     try:
         account = await AccountService(session).create(
             login=data.login, password=data.password, server=data.server,
-            terminal_paths=terminal_pool.terminal_paths,
+            terminal_paths=terminal_pool.placeable_terminals,
         )
     except AccountExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    future = await service.request(
-        session, account, SyncKind.initial, connect_timeout_ms=settings.terminal_initial_connect_timeout_ms
-    )
     await session.close()
-
-    try:
-        await asyncio.wait_for(asyncio.shield(future), timeout=settings.hard_sync_wait_timeout_seconds)
-    except asyncio.TimeoutError:
-        log_event(logger, "warning", "account.initial_sync.wait_timeout", account_id=account.account_id)
+    future = await _initial_sync(service, account.account_id)
+    if future.done() and future.result().quarantined:
+        future = await _initial_sync(service, account.account_id)
 
     if future.done() and future.result().ok and future.result().history_withheld:
         raise HTTPException(
@@ -109,6 +104,19 @@ async def create_account(
             },
         )
     return account_to_response(account)
+
+
+async def _initial_sync(service: SyncService, account_id: str) -> asyncio.Future:
+    async with async_session_factory() as session:
+        account = await load_account(session, account_id)
+        future = await service.request(
+            session, account, SyncKind.initial, connect_timeout_ms=settings.terminal_initial_connect_timeout_ms
+        )
+    try:
+        await asyncio.wait_for(asyncio.shield(future), timeout=settings.hard_sync_wait_timeout_seconds)
+    except asyncio.TimeoutError:
+        log_event(logger, "warning", "account.initial_sync.wait_timeout", account_id=account_id)
+    return future
 
 
 @router.get("/accounts", response_model=AccountListResponse, summary="List accounts")

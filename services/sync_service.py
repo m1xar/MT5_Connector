@@ -43,7 +43,9 @@ class SyncService:
                     log_event(logger, "debug", "sync.request.deduped", account_id=account.account_id)
                     return pending
 
-            terminal_path = await ensure_assigned(session, account, self.pool.terminal_paths)
+            terminal_path = await ensure_assigned(
+                session, account, self.pool.keepable_terminals, self.pool.placeable_terminals
+            )
             already_measured = frozenset(
                 await PositionRepository(session).measured_external_ids(account.account_id)
             )
@@ -92,6 +94,10 @@ class SyncService:
         account = await account_repo.get(result.account_id)
         if account is None:
             log_event(logger, "warning", "sync.persist.account_missing")
+            return
+
+        if result.quarantined:
+            log_event(logger, "warning", "sync.persist.quarantined", kind=result.kind.value, worker_id=result.worker_id)
             return
 
         if not result.ok or result.payload is None:

@@ -15,6 +15,7 @@ from services.proxy_service import ProxyRegistry
 from utils.logging import log_event
 from utils.procs import kill_stale_updaters
 
+from .health import HealthBoard, TerminalState
 from .protocol import PRIORITY_HARD, PRIORITY_SCHEDULED, SyncResult, SyncTask, WorkerState
 from .worker import worker_main
 from .worker_handle import WorkerHandle
@@ -79,6 +80,9 @@ class PoolManager:
         self.on_result: ResultHandler | None = None
         self.task_timeout_seconds = task_timeout_seconds
         self.max_task_retries = max_task_retries
+        self.health = HealthBoard(
+            terminal_paths, warmup_seconds=worker_start_timeout_seconds + cold_start_timeout_ms / 1000
+        )
 
         self._mp = multiprocessing.get_context("spawn")
         self._worker_start_timeout = worker_start_timeout_seconds
@@ -129,6 +133,7 @@ class PoolManager:
         ]
         self._reproxy_due = asyncio.get_running_loop().time() + self._proxy_recheck_seconds
         self._reaper = asyncio.create_task(self._reap_loop(), name="pool-reaper")
+        self.health.start_warmup()
         log_event(
             logger, "info", "pool.started",
             workers=len(workers), ready=sum(1 for worker in workers if worker.state is WorkerState.idle),
@@ -201,6 +206,10 @@ class PoolManager:
         if self._closing:
             future.set_result(self._failure(worker, item, "pool is shutting down"))
             return future
+        if not self.health.terminals[terminal_path].usable:
+            log_event(logger, "warning", "pool.task.refused", account_id=account_id, terminal_path=terminal_path)
+            future.set_result(self._quarantined_failure(worker, item))
+            return future
         self._pending.setdefault(account_id, future)
         self._enqueue(worker, item)
         log_event(
@@ -215,6 +224,14 @@ class PoolManager:
 
     def queue_depth_for(self, terminal_path: str) -> int:
         return self._workers[terminal_path].queue_depth
+
+    @property
+    def placeable_terminals(self) -> list[str]:
+        return self.health.placeable()
+
+    @property
+    def keepable_terminals(self) -> list[str]:
+        return self.health.keepable()
 
     def _enqueue(self, worker: WorkerHandle, item: _QueuedTask) -> None:
         if item.priority == PRIORITY_HARD:
@@ -270,7 +287,10 @@ class PoolManager:
                     await self._reproxy_idle()
                 for pid, path in await asyncio.to_thread(kill_stale_updaters, _UPDATER_MAX_AGE_SECONDS):
                     log_event(logger, "warning", "pool.terminal.liveupdate_killed", pid=pid, path=path)
-                failed = [worker for worker in self._workers.values() if worker.state is WorkerState.failed]
+                failed = [
+                    worker for worker in self._workers.values()
+                    if worker.state is WorkerState.failed and self.health.terminals[worker.terminal_path].usable
+                ]
                 if not failed:
                     continue
                 for worker in failed:
@@ -287,6 +307,8 @@ class PoolManager:
     async def _reproxy_idle(self) -> None:
         for worker in self._workers.values():
             if worker.proxy is not None or worker.state is not WorkerState.idle or self._closing:
+                continue
+            if self.health.state(worker.terminal_path) is not TerminalState.healthy:
                 continue
             proxy = await self._proxy_registry.rotate(worker.terminal_path, None)
             if proxy is None or worker.state is not WorkerState.idle:
@@ -330,6 +352,9 @@ class PoolManager:
         if self._closing:
             self._resolve(item, self._failure(worker, item, "pool is shutting down"))
             return
+        if self._record_health(worker, task.server, result) is TerminalState.quarantined:
+            await self._quarantine(worker, item, result)
+            return
 
         if result.proxy_dead and self._proxy_registry is not None:
             dead = worker.proxy
@@ -352,6 +377,50 @@ class PoolManager:
             self._enqueue(worker, item)
             return
         await self._complete(item, result)
+
+    def _record_health(self, worker: WorkerHandle, server: str, result: SyncResult) -> TerminalState | None:
+        health = self.health.terminals[worker.terminal_path]
+        before = health.state
+        try:
+            after = self.health.record(worker.terminal_path, server, result)
+        except Exception as exc:
+            log_event(logger, "error", "pool.health.failed", worker_id=worker.worker_id, error=f"{type(exc).__name__}: {exc}")
+            return None
+        report = result.terminal
+        if report is not None and report.replaced:
+            log_event(logger, "warning", "pool.terminal.replaced", worker_id=worker.worker_id, pid=report.pid)
+        if after is before:
+            return after
+        if after is TerminalState.suspect:
+            log_event(
+                logger, "warning", "pool.terminal.suspect",
+                worker_id=worker.worker_id, terminal_path=worker.terminal_path, strikes=health.strikes,
+            )
+        elif after is TerminalState.healthy:
+            log_event(logger, "info", "pool.terminal.recovered", worker_id=worker.worker_id, terminal_path=worker.terminal_path)
+        return after
+
+    async def _quarantine(self, worker: WorkerHandle, item: _QueuedTask, result: SyncResult) -> None:
+        health = self.health.terminals[worker.terminal_path]
+        worker.last_error = f"terminal quarantined: {health.quarantine_reason}"
+        worker.mark_failed()
+        log_event(
+            logger, "error", "pool.terminal.quarantined",
+            worker_id=worker.worker_id, terminal_path=worker.terminal_path, reason=health.quarantine_reason,
+            strikes=health.strikes, hard_strikes=health.hard_strikes, servers=sorted(health.failed_servers),
+            queued=worker.queue_depth,
+        )
+        result.quarantined = True
+        await self._complete(item, result)
+        while not worker.queue.empty():
+            _, _, queued = worker.queue.get_nowait()
+            await self._complete(queued, self._quarantined_failure(worker, queued))
+        worker.hard_queued = 0
+
+    def _quarantined_failure(self, worker: WorkerHandle, item: _QueuedTask) -> SyncResult:
+        failure = self._failure(worker, item, "terminal quarantined; the account is re-pinned on its next sync")
+        failure.quarantined = True
+        return failure
 
     async def _roundtrip(self, worker: WorkerHandle, item: _QueuedTask) -> tuple[SyncResult, bool]:
         try:
