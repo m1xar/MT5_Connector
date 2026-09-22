@@ -5,6 +5,7 @@ import logging
 import multiprocessing
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from itertools import count
 from typing import Awaitable, Callable
 
@@ -12,6 +13,7 @@ from domain.enums import SyncKind
 from mt5api.proxy import Proxy
 from mt5api.terminal import AUTHORIZATION_FAILED, StartGate, is_ipc
 from services.proxy_service import ProxyRegistry
+from utils.alerts import Telegram
 from utils.logging import log_event
 from utils.procs import kill_stale_updaters
 
@@ -21,6 +23,11 @@ from .worker import worker_main
 from .worker_handle import WorkerHandle
 
 logger = logging.getLogger(__name__)
+
+
+def _short(terminal_path: str) -> str:
+    return terminal_path.rsplit("\\", 2)[-2] if "\\" in terminal_path else terminal_path
+
 
 ResultHandler = Callable[[SyncResult], Awaitable[None]]
 
@@ -72,9 +79,14 @@ class PoolManager:
         proxy_recheck_minutes: int = 60,
         cold_start_timeout_ms: int = 120000,
         master_terminal_path: str | None = None,
+        alerts: Telegram | None = None,
+        digest_hour_utc: int = 6,
     ) -> None:
         self.terminal_paths = terminal_paths
         self.master_terminal_path = master_terminal_path
+        self.alerts = alerts
+        self._digest_hour = digest_hour_utc
+        self._digest_sent_on: datetime.date | None = None
         self._proxies = proxies
         self._proxy_registry = proxy_registry
         self._proxy_recheck_seconds = proxy_recheck_minutes * 60.0
@@ -297,6 +309,7 @@ class PoolManager:
                     self.health.tally.liveupdate_killed += 1
                     log_event(logger, "warning", "pool.terminal.liveupdate_killed", pid=pid, path=path)
                 await asyncio.to_thread(self.health.refresh_builds)
+                self._maybe_digest()
                 failed = [
                     worker for worker in self._workers.values()
                     if worker.state is WorkerState.failed and self.health.terminals[worker.terminal_path].usable
@@ -420,12 +433,44 @@ class PoolManager:
             strikes=health.strikes, hard_strikes=health.hard_strikes, servers=sorted(health.failed_servers),
             queued=worker.queue_depth,
         )
+        self._alert(
+            f"Terminal {_short(worker.terminal_path)} quarantined: {health.quarantine_reason} "
+            f"(servers: {', '.join(sorted(health.failed_servers))}). Its accounts move on their next sync."
+        )
         result.quarantined = True
         await self._complete(item, result)
         while not worker.queue.empty():
             _, _, queued = worker.queue.get_nowait()
             await self._complete(queued, self._quarantined_failure(worker, queued))
         worker.hard_queued = 0
+
+    def _alert(self, text: str) -> None:
+        if self.alerts is not None:
+            self.alerts.notify(text)
+
+    def _maybe_digest(self) -> None:
+        now = datetime.now(timezone.utc)
+        if now.hour != self._digest_hour or self._digest_sent_on == now.date():
+            return
+        self._digest_sent_on = now.date()
+        tally = self.health.tally
+        unwell = [
+            f"{_short(health.terminal_path)} {health.state.value}"
+            for health in self.health.snapshot() if health.state is not TerminalState.healthy
+        ]
+        log_event(
+            logger, "info", "pool.digest",
+            syncs_ok=tally.syncs_ok, syncs_failed=tally.syncs_failed, quarantines=tally.quarantines,
+            reclones=tally.reclones, replaced=tally.replaced, liveupdate_killed=tally.liveupdate_killed,
+            unwell=unwell,
+        )
+        self._alert(
+            f"MT5 daily digest: {tally.syncs_ok} syncs ok, {tally.syncs_failed} failed, "
+            f"{tally.quarantines} quarantines, {tally.reclones} reclones, {tally.replaced} LiveUpdate relaunches, "
+            f"{tally.liveupdate_killed} hung updaters killed. "
+            + (f"Not healthy: {', '.join(unwell)}." if unwell else "All terminals healthy.")
+        )
+        tally.reset()
 
     def _quarantined_failure(self, worker: WorkerHandle, item: _QueuedTask) -> SyncResult:
         failure = self._failure(worker, item, "terminal quarantined; the account is re-pinned on its next sync")

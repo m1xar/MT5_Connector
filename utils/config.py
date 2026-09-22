@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_json: bool = True
 
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    alert_digest_hour_utc: int = 6
+
     @property
     def terminals(self) -> list[str]:
         raw = self.terminal_paths.replace("\n", ";")
@@ -71,6 +75,8 @@ class Settings(BaseSettings):
             issues.append("MT5_API_API_TOKEN is empty, so every route is unauthenticated")
         if not self.webshare_api_key:
             issues.append("MT5_API_WEBSHARE_API_KEY is empty, so the terminals connect without proxies")
+        if bool(self.telegram_bot_token) != bool(self.telegram_chat_id):
+            issues.append("MT5_API_TELEGRAM_BOT_TOKEN and MT5_API_TELEGRAM_CHAT_ID must be set together; alerts are off")
         return issues
 
 

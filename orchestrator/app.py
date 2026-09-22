@@ -14,6 +14,7 @@ from db.session import async_session_factory, dispose_db, init_db
 from pool.manager import PoolManager
 from services.proxy_service import ProxyRegistry, WebshareClient
 from services.sync_service import SyncService
+from utils.alerts import Telegram, describe_duration, host_uptime_seconds
 from utils.config import settings
 from utils.logging import bind_context, configure_logging, log_event, reset_context
 
@@ -37,6 +38,7 @@ async def lifespan(app: FastAPI):
         log_event(logger, "warning", "app.startup.config", problem=problem)
 
     paths = settings.terminals
+    alerts = Telegram(settings.telegram_bot_token, settings.telegram_chat_id)
     proxy_registry = None
     proxies = None
     if settings.webshare_api_key:
@@ -63,6 +65,8 @@ async def lifespan(app: FastAPI):
         proxy_recheck_minutes=settings.proxy_recheck_minutes,
         cold_start_timeout_ms=settings.terminal_initial_connect_timeout_ms,
         master_terminal_path=settings.master_terminal,
+        alerts=alerts,
+        digest_hour_utc=settings.alert_digest_hour_utc,
     )
     sync_service = SyncService(terminal_pool)
     terminal_pool.on_result = sync_service.persist
@@ -76,6 +80,11 @@ async def lifespan(app: FastAPI):
     await terminal_pool.start()
     scheduler = asyncio.create_task(sync_service.run_scheduler(), name="sync-scheduler")
     log_event(logger, "info", "app.startup.completed", terminals=len(paths))
+    uptime = host_uptime_seconds()
+    alerts.notify(
+        f"MT5 Sync API started: {terminal_pool.healthy_workers}/{len(paths)} terminals ready, "
+        f"host up {describe_duration(uptime) if uptime is not None else 'unknown'}"
+    )
 
     try:
         yield
