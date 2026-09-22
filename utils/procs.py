@@ -10,6 +10,7 @@ TH32CS_SNAPPROCESS = 0x2
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_TERMINATE = 0x1
 INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+_EPOCH_AS_FILETIME = 116_444_736_000_000_000
 
 
 class _ProcessEntry(ctypes.Structure):
@@ -39,6 +40,7 @@ def _kernel32():
         wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
     ]
     k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
     k32.CloseHandle.argtypes = [wintypes.HANDLE]
     return k32
 
@@ -57,29 +59,54 @@ def _image_path(k32, pid: int) -> str | None:
         k32.CloseHandle(handle)
 
 
-def pids_of(exe_path: str) -> list[int]:
+def _processes_named(name: str) -> list[tuple[int, str]]:
     if sys.platform != "win32":
         return []
     k32 = _kernel32()
-    wanted = os.path.normcase(os.path.abspath(exe_path))
-    name = os.path.basename(exe_path).lower()
     snapshot = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if snapshot == INVALID_HANDLE_VALUE:
         return []
     entry = _ProcessEntry()
     entry.dwSize = ctypes.sizeof(entry)
-    found: list[int] = []
+    found: list[tuple[int, str]] = []
     try:
         more = k32.Process32FirstW(snapshot, ctypes.byref(entry))
         while more:
             if entry.szExeFile.lower() == name:
                 path = _image_path(k32, entry.th32ProcessID)
-                if path and os.path.normcase(path) == wanted:
-                    found.append(entry.th32ProcessID)
+                if path:
+                    found.append((entry.th32ProcessID, os.path.normcase(path)))
             more = k32.Process32NextW(snapshot, ctypes.byref(entry))
     finally:
         k32.CloseHandle(snapshot)
     return found
+
+
+def pids_of(exe_path: str) -> list[int]:
+    wanted = os.path.normcase(os.path.abspath(exe_path))
+    return [pid for pid, path in _processes_named(os.path.basename(exe_path).lower()) if path == wanted]
+
+
+def updater_pids(exe_name: str = "terminal64.exe") -> list[tuple[int, str]]:
+    return [(pid, path) for pid, path in _processes_named(exe_name) if os.sep + "liveupdate" + os.sep in path]
+
+
+def started_at(pid: int) -> float | None:
+    if sys.platform != "win32":
+        return None
+    k32 = _kernel32()
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not k32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+            return None
+        creation = times[0]
+        ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        return (ticks - _EPOCH_AS_FILETIME) / 10_000_000
+    finally:
+        k32.CloseHandle(handle)
 
 
 def terminate(pid: int) -> bool:
@@ -101,3 +128,11 @@ def terminate_all(exe_path: str, wait_seconds: float = 10.0) -> list[int]:
     while pids and pids_of(exe_path) and time.monotonic() < deadline:
         time.sleep(0.5)
     return pids
+
+
+def kill_stale_updaters(older_than_seconds: float) -> list[tuple[int, str]]:
+    cutoff = time.time() - older_than_seconds
+    stale = [(pid, path) for pid, path in updater_pids() if (started_at(pid) or time.time()) < cutoff]
+    for pid, _ in stale:
+        terminate(pid)
+    return stale

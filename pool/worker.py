@@ -113,7 +113,7 @@ def _run_task(
         else:
             terminal.forget_login()
         result.error, result.error_code, result.terminal_lost = str(exc), exc.code, exc.terminal_lost
-        result.proxy_dead = exc.proxy_dead
+        result.proxy_dead, result.terminal = exc.proxy_dead, terminal.take_report()
         result.duration_ms = int((time.perf_counter() - started) * 1000)
         log_event(
             logger, "warning", "worker.task.failed",
@@ -123,12 +123,12 @@ def _run_task(
         return result
     except Exception as exc:
         terminal.forget_login()
-        result.error = f"{type(exc).__name__}: {exc}"
+        result.error, result.terminal = f"{type(exc).__name__}: {exc}", terminal.take_report()
         result.duration_ms = int((time.perf_counter() - started) * 1000)
         log_event(logger, "error", "worker.task.crashed", worker_id=worker_id, account_id=task.account_id, error=result.error)
         return result
 
-    result.ok, result.payload = True, payload
+    result.ok, result.payload, result.terminal = True, payload, terminal.take_report()
     result.duration_ms = int((time.perf_counter() - started) * 1000)
     log_event(
         logger, "info", "worker.task.completed",

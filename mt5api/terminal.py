@@ -9,6 +9,7 @@ from utils.logging import log_event
 from utils.procs import pids_of, terminate_all
 
 from .proxy import (
+    Marker,
     Proxy,
     marker_for,
     probe,
@@ -17,6 +18,7 @@ from .proxy import (
     write_marker,
     write_startup_ini,
 )
+from .report import StartReport
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,7 @@ AUTHORIZATION_FAILED = -6
 _START_LOCK_HOLD_SECONDS = 20.0
 _LAUNCH_WAIT_SECONDS = 15.0
 _LAUNCH_SETTLE_SECONDS = 3.0
+_ATTACH_FAILURES_BEFORE_KILL = 2
 
 
 def is_ipc(code: int | None) -> bool:
@@ -102,6 +105,12 @@ class MT5Terminal:
         self.cold_start_timeout_ms = cold_start_timeout_ms
         self._mt5: Any | None = None
         self._current_login: tuple[int, str, str] | None = None
+        self._attach_failures = 0
+        self.report: StartReport | None = None
+
+    def take_report(self) -> StartReport | None:
+        report, self.report = self.report, None
+        return report
 
     @property
     def mt5(self) -> Any:
@@ -146,7 +155,11 @@ class MT5Terminal:
             remove_startup_ini(self.path)
         if not ok:
             code, description = module.last_error()
+            self._note_initialize_failure(code)
             raise self.failure(f"initialize failed for {login}@{server}: {description}{_diagnose(code, server)}", code)
+        if self.report is not None:
+            self.report.initialized = True
+        self._attach_failures = 0
         self._mt5 = module
         self._current_login = (login, password, server)
         log_event(
@@ -155,33 +168,68 @@ class MT5Terminal:
             proxy=marker_for(self.proxy) if self.managed else None,
         )
 
+    def _note_initialize_failure(self, code: int | None) -> None:
+        report = self.report
+        if report is None:
+            return
+        report.ipc_failed, report.error_code = is_ipc(code), code
+        if report.attached and is_ipc(code):
+            self._attach_failures += 1
+        if not pids_of(self.path):
+            report.died = True
+
     def _prepare(self, login: int, password: str, server: str) -> bool:
+        report = self.report = StartReport()
         wanted = marker_for(self.proxy)
         running = pids_of(self.path)
-        if running and read_marker(self.path) == wanted:
-            log_event(logger, "info", "terminal.attach", path=self.path, pids=running, proxy=wanted)
-            return False
         if running:
+            marker = read_marker(self.path)
+            blocker = self._attach_blocker(running, marker, wanted)
+            if blocker is None:
+                report.attached, report.pid = True, marker.pid
+                log_event(logger, "info", "terminal.attach", path=self.path, pids=running, proxy=wanted)
+                return False
+            report.killed = blocker
             log_event(
                 logger, "warning", "terminal.kill",
-                path=self.path, pids=running, running_with=read_marker(self.path), wanted=wanted,
+                path=self.path, pids=running, reason=blocker, running_with=marker, wanted=wanted,
             )
             terminate_all(self.path)
-        if self.proxy is None:
-            write_marker(self.path, None)
-            return True
-        if not probe(self.proxy, self.proxy_probe_timeout_seconds):
+        self._attach_failures = 0
+        if self.proxy is not None and not probe(self.proxy, self.proxy_probe_timeout_seconds):
             raise TerminalError(f"proxy {self.proxy.endpoint} did not answer the probe", proxy_dead=True)
         ini = write_startup_ini(self.path, login, password, server, self.proxy)
-        write_marker(self.path, self.proxy)
         arguments = [self.path, *(["/portable"] if self.portable else []), f"/config:{ini}"]
-        subprocess.Popen(arguments, close_fds=True)
+        try:
+            process = subprocess.Popen(arguments, close_fds=True)
+        except OSError as exc:
+            report.died = True
+            raise TerminalError(f"terminal would not start: {exc}") from exc
         deadline = time.monotonic() + _LAUNCH_WAIT_SECONDS
-        while not pids_of(self.path) and time.monotonic() < deadline:
+        while process.pid not in pids_of(self.path) and time.monotonic() < deadline:
             time.sleep(0.5)
         time.sleep(_LAUNCH_SETTLE_SECONDS)
-        log_event(logger, "info", "terminal.launched", path=self.path, proxy=wanted, pids=pids_of(self.path))
+        alive = pids_of(self.path)
+        if process.pid not in alive:
+            if alive:
+                report.replaced = True
+                terminate_all(self.path)
+                raise TerminalError(f"terminal {process.pid} handed over to {alive} without our config")
+            report.died = True
+            raise TerminalError(f"terminal {process.pid} exited within {_LAUNCH_SETTLE_SECONDS:.0f}s of launch")
+        write_marker(self.path, self.proxy, process.pid)
+        report.launched, report.pid = True, process.pid
+        log_event(logger, "info", "terminal.launched", path=self.path, proxy=wanted, pid=process.pid)
         return True
+
+    def _attach_blocker(self, running: list[int], marker: Marker | None, wanted: str) -> str | None:
+        if marker is None or marker.proxy != wanted:
+            return "proxy_mismatch"
+        if marker.pid not in running:
+            return "pid_mismatch"
+        if self._attach_failures >= _ATTACH_FAILURES_BEFORE_KILL:
+            return "zombie"
+        return None
 
     def _login(self, login: int, password: str, server: str, timeout_ms: int) -> None:
         self._current_login = None

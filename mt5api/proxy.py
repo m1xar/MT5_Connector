@@ -22,6 +22,12 @@ def marker_for(proxy: Proxy | None) -> str:
     return proxy.endpoint if proxy else DIRECT
 
 
+@dataclass(frozen=True, slots=True)
+class Marker:
+    proxy: str
+    pid: int | None
+
+
 def _config_dir(terminal_path: str) -> Path:
     return Path(terminal_path).parent / "config"
 
@@ -48,17 +54,25 @@ def remove_startup_ini(terminal_path: str) -> None:
     startup_ini_path(terminal_path).unlink(missing_ok=True)
 
 
-def read_marker(terminal_path: str) -> str | None:
+def read_marker(terminal_path: str) -> Marker | None:
     try:
-        return marker_path(terminal_path).read_text(encoding="utf-8").strip() or None
+        text = marker_path(terminal_path).read_text(encoding="utf-8").split()
     except OSError:
         return None
+    if not text:
+        return None
+    pid = int(text[1]) if len(text) > 1 and text[1].isdigit() else None
+    return Marker(text[0], pid)
 
 
-def write_marker(terminal_path: str, proxy: Proxy | None) -> None:
+def write_marker(terminal_path: str, proxy: Proxy | None, pid: int) -> None:
     path = marker_path(terminal_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(marker_for(proxy) + "\n", encoding="utf-8")
+    path.write_text(f"{marker_for(proxy)} {pid}\n", encoding="utf-8")
+
+
+def remove_marker(terminal_path: str) -> None:
+    marker_path(terminal_path).unlink(missing_ok=True)
 
 
 def probe(proxy: Proxy, timeout_seconds: float) -> bool:

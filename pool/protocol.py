@@ -5,6 +5,7 @@ from enum import Enum
 
 from domain.enums import SyncKind
 from domain.fx import SyncPayload
+from mt5api.report import StartReport
 
 PRIORITY_HARD = 0
 PRIORITY_SCHEDULED = 1
@@ -47,3 +48,4 @@ class SyncResult:
     kind: SyncKind = SyncKind.scheduled
     history_withheld: bool = False
     proxy_dead: bool = False
+    terminal: StartReport | None = None

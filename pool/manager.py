@@ -13,6 +13,7 @@ from mt5api.proxy import Proxy
 from mt5api.terminal import AUTHORIZATION_FAILED, StartGate, is_ipc
 from services.proxy_service import ProxyRegistry
 from utils.logging import log_event
+from utils.procs import kill_stale_updaters
 
 from .protocol import PRIORITY_HARD, PRIORITY_SCHEDULED, SyncResult, SyncTask, WorkerState
 from .worker import worker_main
@@ -25,6 +26,7 @@ ResultHandler = Callable[[SyncResult], Awaitable[None]]
 _SHUTDOWN_DRAIN_SECONDS = 30.0
 _REAP_INTERVAL_SECONDS = 60.0
 _SPAWN_BATCH = 4
+_UPDATER_MAX_AGE_SECONDS = 600.0
 
 
 @dataclass
@@ -266,6 +268,8 @@ class PoolManager:
                 if self._proxy_registry and asyncio.get_running_loop().time() >= self._reproxy_due:
                     self._reproxy_due = asyncio.get_running_loop().time() + self._proxy_recheck_seconds
                     await self._reproxy_idle()
+                for pid, path in await asyncio.to_thread(kill_stale_updaters, _UPDATER_MAX_AGE_SECONDS):
+                    log_event(logger, "warning", "pool.terminal.liveupdate_killed", pid=pid, path=path)
                 failed = [worker for worker in self._workers.values() if worker.state is WorkerState.failed]
                 if not failed:
                     continue
