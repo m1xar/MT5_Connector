@@ -67,6 +67,8 @@ async def lifespan(app: FastAPI):
         master_terminal_path=settings.master_terminal,
         alerts=alerts,
         digest_hour_utc=settings.alert_digest_hour_utc,
+        reclone=settings.terminal_reclone,
+        reclone_min_interval_minutes=settings.reclone_min_interval_minutes,
     )
     sync_service = SyncService(terminal_pool)
     terminal_pool.on_result = sync_service.persist

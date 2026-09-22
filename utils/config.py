@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     terminal_paths: str = ""
     terminal_portable: bool = False
     master_terminal_path: str = ""
+    terminal_reclone: bool = True
+    reclone_min_interval_minutes: int = 60
     terminal_init_timeout_ms: int = 30000
     terminal_login_timeout_ms: int = 30000
     terminal_initial_connect_timeout_ms: int = 120000
@@ -71,6 +73,8 @@ class Settings(BaseSettings):
         for path in self.terminals:
             if not Path(path).is_file():
                 issues.append(f"terminal not found: {path}")
+        if self.terminal_reclone and self.master_terminal and not Path(self.master_terminal).is_file():
+            issues.append(f"master terminal not found: {self.master_terminal}; a quarantined terminal cannot be recloned")
         if not self.api_token:
             issues.append("MT5_API_API_TOKEN is empty, so every route is unauthenticated")
         if not self.webshare_api_key:

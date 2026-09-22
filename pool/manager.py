@@ -17,8 +17,9 @@ from utils.alerts import Telegram
 from utils.logging import log_event
 from utils.procs import kill_stale_updaters
 
-from .health import HealthBoard, PoolInspection, TerminalState, inspect
+from .health import HealthBoard, PoolInspection, TerminalState, build_of, inspect
 from .protocol import PRIORITY_HARD, PRIORITY_SCHEDULED, SyncResult, SyncTask, WorkerState
+from .reclone import reclone_terminal
 from .worker import worker_main
 from .worker_handle import WorkerHandle
 
@@ -81,12 +82,18 @@ class PoolManager:
         master_terminal_path: str | None = None,
         alerts: Telegram | None = None,
         digest_hour_utc: int = 6,
+        reclone: bool = True,
+        reclone_min_interval_minutes: int = 60,
     ) -> None:
         self.terminal_paths = terminal_paths
         self.master_terminal_path = master_terminal_path
         self.alerts = alerts
         self._digest_hour = digest_hour_utc
         self._digest_sent_on: datetime.date | None = None
+        self._reclone = reclone
+        self._reclone_interval = reclone_min_interval_minutes * 60.0
+        self._reclone_lock = asyncio.Lock()
+        self._master_behind_on: datetime.date | None = None
         self._proxies = proxies
         self._proxy_registry = proxy_registry
         self._proxy_recheck_seconds = proxy_recheck_minutes * 60.0
@@ -310,6 +317,7 @@ class PoolManager:
                     log_event(logger, "warning", "pool.terminal.liveupdate_killed", pid=pid, path=path)
                 await asyncio.to_thread(self.health.refresh_builds)
                 self._maybe_digest()
+                await self._maybe_reclone()
                 failed = [
                     worker for worker in self._workers.values()
                     if worker.state is WorkerState.failed and self.health.terminals[worker.terminal_path].usable
@@ -443,6 +451,50 @@ class PoolManager:
             _, _, queued = worker.queue.get_nowait()
             await self._complete(queued, self._quarantined_failure(worker, queued))
         worker.hard_queued = 0
+
+    async def _maybe_reclone(self) -> None:
+        if not self._reclone or self._reclone_lock.locked() or self._closing:
+            return
+        path = self.health.due_for_reclone(self._reclone_interval)
+        if path is None:
+            return
+        async with self._reclone_lock:
+            worker = self._workers[path]
+            quorum = self.health.quorum()
+            self.health.mark_recloning(path)
+            log_event(logger, "warning", "pool.terminal.recloning", worker_id=worker.worker_id, terminal_path=path, quorum=quorum)
+            await worker.terminate()
+            try:
+                report = await asyncio.to_thread(reclone_terminal, path, self.master_terminal_path, quorum)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                self.health.mark_reclone_failed(path, error)
+                log_event(logger, "error", "pool.terminal.reclone_failed", worker_id=worker.worker_id, terminal_path=path, error=error)
+                self._alert(f"Terminal {_short(path)} could not be recloned: {error}. It stays quarantined; next try in an hour.")
+                return
+            if await worker.restart():
+                worker.mark_idle()
+                self.health.mark_recloned(path)
+                log_event(
+                    logger, "warning", "pool.terminal.recloned",
+                    worker_id=worker.worker_id, terminal_path=path, broken_dir=report.broken_dir, build=report.build,
+                    servers_dat_carried=report.servers_dat_carried, seconds=report.seconds,
+                )
+                self._alert(f"Terminal {_short(path)} recloned from the master in {report.seconds:.0f}s and back in the pool.")
+            else:
+                self.health.mark_reclone_failed(path, "worker did not start after the reclone")
+                self._alert(f"Terminal {_short(path)} was recloned but its worker did not start; it stays quarantined.")
+            master_build = await asyncio.to_thread(lambda: build_of(self.master_terminal_path, None, None)[0])
+            if quorum and master_build and master_build != quorum[0]:
+                self._master_behind()
+
+    def _master_behind(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        if self._master_behind_on == today:
+            return
+        self._master_behind_on = today
+        log_event(logger, "warning", "pool.reclone.master_behind", master=self.master_terminal_path)
+        self._alert("The master terminal is behind the build the pool runs; refresh it with make-master.sh.")
 
     def _alert(self, text: str) -> None:
         if self.alerts is not None:
