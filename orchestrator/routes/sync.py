@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from domain.enums import SyncKind
+from domain.rows import payload_from_rows
 from pool.manager import PoolManager
 from schemas.sync import SyncQueuedResponse, SyncResultResponse
 from services.sync_service import SyncService
@@ -62,7 +63,7 @@ async def sync_account(
             detail=f"Hard sync still running after {settings.hard_sync_wait_timeout_seconds}s; poll the account instead",
         )
 
-    payload = result.payload
+    payload = await asyncio.to_thread(payload_from_rows, result.payload) if result.payload else None
     return SyncResultResponse(
         account_id=result.account_id,
         ok=result.ok,

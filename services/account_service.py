@@ -27,8 +27,11 @@ class AccountService:
         self.repo = AccountRepository(session)
 
     async def create(self, *, login: int, password: str, server: str, terminal_paths: Sequence[str]) -> MT5Account:
-        if await self.repo.get_by_login(login, server) is not None:
-            raise AccountExistsError(f"account {login}@{server} already exists")
+        existing = await self.repo.get_by_login(login, server)
+        if existing is not None:
+            if existing.last_synced_at is not None or existing.status is not AccountStatus.error_connection:
+                raise AccountExistsError(f"account {login}@{server} already exists")
+            return await self._retake(existing, password, terminal_paths)
         terminal_path = pick_terminal(terminal_paths, await self.repo.counts_by_terminal())
         account = await self.repo.create(
             MT5Account(login=login, password=password, server=server, terminal_path=terminal_path)
@@ -39,6 +42,22 @@ class AccountService:
             account_id=account.account_id, login=login, terminal_path=terminal_path,
         )
         return account
+
+    async def _retake(self, account: MT5Account, password: str, terminal_paths: Sequence[str]) -> MT5Account:
+        account.password = password
+        account.status = AccountStatus.active
+        account.consecutive_failures = 0
+        account.last_error = None
+        account.history_withheld_until = None
+        account.enabled = True
+        account.terminal_path = pick_terminal(terminal_paths, await self.repo.counts_by_terminal())
+        updated = await self.repo.update(account)
+        await self.session.commit()
+        log_event(
+            logger, "info", "account.retaken",
+            account_id=account.account_id, login=account.login, terminal_path=account.terminal_path,
+        )
+        return updated
 
     async def update(
         self, account: MT5Account, *, password: str | None = None, enabled: bool | None = None

@@ -4,6 +4,7 @@ import logging
 import time
 from typing import Any
 
+from domain.rows import rows_from_payload
 from mt5api.cache import prune_price_cache
 from mt5api.enrichment import enrich_mae_mfe
 from mt5api.fetch import fetch_candles, fetch_history, history_withheld
@@ -128,7 +129,7 @@ def _run_task(
         log_event(logger, "error", "worker.task.crashed", worker_id=worker_id, account_id=task.account_id, error=result.error)
         return result
 
-    result.ok, result.payload, result.terminal = True, payload, terminal.take_report()
+    result.ok, result.payload, result.terminal = True, rows_from_payload(payload), terminal.take_report()
     result.duration_ms = int((time.perf_counter() - started) * 1000)
     log_event(
         logger, "info", "worker.task.completed",

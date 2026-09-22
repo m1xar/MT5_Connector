@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import async_session_factory
 from domain.enums import AccountStatus, SyncKind
+from mt5api.terminal import AUTHORIZATION_FAILED
 from pool.manager import PoolManager
 from repositories.account_repo import AccountRepository
 from schemas.account import (
@@ -42,11 +43,15 @@ router = APIRouter(tags=["Accounts"], responses=COMMON_RESPONSES, dependencies=[
         "runs on that one terminal, and the response reports it as `terminal`. "
         "It then queues an **initial sync** ahead of everything else on that "
         "terminal, with a longer connect timeout than a routine sync "
-        "gets, and only one attempt at it. If that attempt fails the account is "
-        "marked `error_connection` straight away - it has never connected, so "
-        "there is nothing for the failure to be a blip in. The request blocks "
-        "on that sync and returns the settled account, or **502** with the "
-        "account id and the error if it did not complete.\n\n"
+        "gets, and only one attempt at it. If the broker rejects the credentials "
+        "the answer is **422** `invalid_credentials` and nothing is kept: register "
+        "again with the right ones. If the attempt fails for any other reason the "
+        "account is marked `error_connection` straight away - it has never "
+        "connected, so there is nothing for the failure to be a blip in - and the "
+        "request answers **502** with the account id and the error. A POST for a "
+        "login that exists in that state takes the row over: new password, new "
+        "terminal, a fresh initial sync. A login that has ever synced is **409**; "
+        "change its password with PATCH.\n\n"
         "Use the **investor password**. A master password logs in just as well, "
         "but a broker that sees the owner's own terminal connected withholds "
         "the deal history from the second session, and the sync would record an "
@@ -55,8 +60,8 @@ router = APIRouter(tags=["Accounts"], responses=COMMON_RESPONSES, dependencies=[
     ),
     responses={
         **COMMON_RESPONSES,
-        409: {"model": ErrorResponse, "description": "Already exists"},
-        422: {"description": "Logged in, but the broker withheld the deal history - register with the investor password"},
+        409: {"model": ErrorResponse, "description": "Already exists and has synced; use PATCH"},
+        422: {"description": "`invalid_credentials`: the broker rejected the login or password; `history_withheld`: logged in, but the broker withheld the deal history - register with the investor password. Nothing is kept either way"},
     },
 )
 async def create_account(
@@ -77,6 +82,15 @@ async def create_account(
     future = await _initial_sync(service, account.account_id)
     if future.done() and future.result().quarantined:
         future = await _initial_sync(service, account.account_id)
+
+    if future.done() and future.result().error_code == AUTHORIZATION_FAILED:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_credentials",
+                "detail": f"{data.server} answered and rejected the login or password for {data.login}",
+            },
+        )
 
     if future.done() and future.result().ok and future.result().history_withheld:
         raise HTTPException(

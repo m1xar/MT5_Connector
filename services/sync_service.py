@@ -7,6 +7,7 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import async_session_factory
+from mt5api.terminal import AUTHORIZATION_FAILED
 from domain.enums import SyncKind
 from domain.models import MT5Account
 from pool.manager import PoolManager
@@ -100,6 +101,11 @@ class SyncService:
             log_event(logger, "warning", "sync.persist.quarantined", kind=result.kind.value, worker_id=result.worker_id)
             return
 
+        if result.kind is SyncKind.initial and result.error_code == AUTHORIZATION_FAILED:
+            await AccountService(session).delete(account)
+            log_event(logger, "warning", "sync.persist.credentials.rejected", login=account.login, server=account.server)
+            return
+
         if not result.ok or result.payload is None:
             await account_repo.mark_error(
                 account,
@@ -124,10 +130,10 @@ class SyncService:
         transactions_count = await TransactionRepository(session).upsert_many(account.account_id, payload.transactions)
         await account_repo.mark_synced(
             account,
-            balance=payload.account_info.balance,
+            balance=payload.balance,
             equity=payload.equity,
-            leverage=payload.account_info.leverage,
-            currency=payload.account_info.currency,
+            leverage=payload.leverage,
+            currency=payload.currency,
             server_clock=payload.server_clock,
         )
         log_event(
@@ -148,10 +154,10 @@ class SyncService:
         open_count = await OpenPositionRepository(session).replace_all(account.account_id, payload.open_positions)
         await account_repo.mark_withheld(
             account,
-            balance=payload.account_info.balance,
+            balance=payload.balance,
             equity=payload.equity,
-            leverage=payload.account_info.leverage,
-            currency=payload.account_info.currency,
+            leverage=payload.leverage,
+            currency=payload.currency,
             server_clock=payload.server_clock,
             pause_minutes=settings.history_withheld_pause_minutes,
         )

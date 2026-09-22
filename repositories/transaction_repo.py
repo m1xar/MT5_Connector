@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from datetime import datetime
 from typing import List, Optional
 
@@ -9,32 +8,25 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from domain import fx
 from domain.models import MT5Transaction, new_id, utc_now
 
 _BATCH = 1000
-
-
-def transaction_fingerprint(transaction: fx.Transaction) -> str:
-    stamp = transaction.time.isoformat() if transaction.time else ""
-    text = f"{stamp}|{transaction.type}|{transaction.amount:.8f}"
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 class TransactionRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def upsert_many(self, account_id: str, transactions: List[fx.Transaction]) -> int:
+    async def upsert_many(self, account_id: str, transactions: List[dict]) -> int:
         if not transactions:
             return 0
         now = utc_now()
         rows: dict[str, dict] = {}
         for transaction in transactions:
-            fingerprint = transaction_fingerprint(transaction)
-            rows.setdefault(fingerprint, {
-                "id": new_id(), "account_id": account_id, "fingerprint": fingerprint,
-                "time": transaction.time, "type": transaction.type, "amount": transaction.amount, "synced_at": now,
+            rows.setdefault(transaction["fingerprint"], {
+                "id": new_id(), "account_id": account_id, "fingerprint": transaction["fingerprint"],
+                "time": transaction["time"], "type": transaction["type"], "amount": transaction["amount"],
+                "synced_at": now,
             })
         added = 0
         batch = list(rows.values())

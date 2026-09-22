@@ -293,7 +293,7 @@ deploy/linux/       install, make-master, clone-pool, service, verify-pool, dock
 
 | Method | Path | |
 |---|---|---|
-| POST | `/accounts` | register: pin to a terminal, block on the initial sync; 422 if the broker withheld the history, 502 if the sync did not complete |
+| POST | `/accounts` | register: pin to a terminal, block on the initial sync; 422 if the broker rejected the credentials or withheld the history (nothing kept), 502 if the sync did not complete (row kept), 409 if the login has synced before |
 | GET/PATCH/DELETE | `/accounts`, `/accounts/{id}` | list, read, update password or `enabled`, delete with all synced data |
 | POST | `/accounts/{id}/sync?wait=true` | hard sync on the pinned terminal, result in the response; 504 after the wait timeout |
 | POST | `/accounts/{id}/sync?wait=false` | 202, queued at normal priority; `queue_depth` is that terminal's queue |
@@ -333,11 +333,16 @@ the deal history back (see *Passwords*), and while it is in the future the
 scheduler does not touch the account at all. A hard sync ignores it, and any
 sync that brings history clears it.
 
-Registration always waits for the initial sync, and answers **502** with the
-account id and the error if it did not complete — an importer that saw 201 would
-tick the account off as done while every read of it returned nothing. The
-account row stays, so a 502 can be followed by a hard sync once the cause is
-fixed.
+Registration always waits for the initial sync. If the broker answered and
+rejected the credentials (`-6`) the answer is **422** `invalid_credentials`
+and no row is kept — there is nothing to fix on our side, and a row would
+only get in the way of the corrected registration. Any other failure answers
+**502** with the account id and the error — an importer that saw 201 would
+tick the account off as done while every read of it returned nothing. That
+row stays, as `error_connection` and never synced, and the next `POST` for
+the same login takes it over: new password, a fresh pin, a fresh initial
+sync. A `POST` for a login that has synced before is **409**; its password
+changes with `PATCH`.
 
 An account flips to `error_connection` when either:
 

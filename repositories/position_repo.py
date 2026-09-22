@@ -8,20 +8,12 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from domain import fx
 from domain.models import MT5OpenPosition, MT5Position, new_id, utc_now
+from domain.rows import OPEN_POSITION_FIELDS, POSITION_FIELDS
 
-_POSITION_FIELDS = (
-    "side", "pair", "amount", "entry_price", "exit_price", "pnl", "net_pnl", "commission", "swap",
-    "mae", "mfe", "rr", "rr_planned", "tp", "sl", "liquidation_price", "multiplier", "isolated",
-    "closed", "status", "balance_init", "created_at", "closed_at",
-)
+_POSITION_FIELDS = POSITION_FIELDS
 _KEPT_WHEN_ABSENT = frozenset({"mae", "mfe"})
 _BATCH = 1000
-
-
-def _orders_json(position: fx.FXPosition | fx.FXOpenPosition) -> list[dict]:
-    return [order.model_dump(by_alias=True, mode="json") for order in position.orders]
 
 
 def _batches(rows: list[dict]):
@@ -33,15 +25,15 @@ class PositionRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def upsert_many(self, account_id: str, positions: List[fx.FXPosition]) -> int:
+    async def upsert_many(self, account_id: str, positions: List[dict]) -> int:
         if not positions:
             return 0
         now = utc_now()
         rows = [
             {
-                **{name: getattr(position, name) for name in _POSITION_FIELDS},
-                "id": new_id(), "account_id": account_id, "external_id": position.id,
-                "orders": _orders_json(position), "synced_at": now,
+                **{name: position[name] for name in _POSITION_FIELDS},
+                "id": new_id(), "account_id": account_id, "external_id": position["external_id"],
+                "orders": position["orders"], "synced_at": now,
             }
             for position in positions
         ]
@@ -93,15 +85,14 @@ class OpenPositionRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def replace_all(self, account_id: str, positions: List[fx.FXOpenPosition]) -> int:
+    async def replace_all(self, account_id: str, positions: List[dict]) -> int:
         await self.session.execute(sa_delete(MT5OpenPosition).where(MT5OpenPosition.account_id == account_id))
         now = utc_now()
         rows = [
             {
-                "id": new_id(), "account_id": account_id, "external_id": position.id,
-                "pair": position.pair, "amount": position.amount, "side": position.side,
-                "entry_price": position.entry_price, "current_price": position.current_price,
-                "open_time": position.open_time, "orders": _orders_json(position), "synced_at": now,
+                **{name: position[name] for name in OPEN_POSITION_FIELDS},
+                "id": new_id(), "account_id": account_id, "external_id": position["external_id"],
+                "orders": position["orders"], "synced_at": now,
             }
             for position in positions
         ]

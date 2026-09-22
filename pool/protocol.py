@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from domain.enums import SyncKind
-from domain.fx import SyncPayload
+from domain.rows import SyncRows
 from mt5api.report import StartReport
 
 PRIORITY_HARD = 0
@@ -38,7 +38,7 @@ class SyncResult:
     task_id: str
     account_id: str
     ok: bool
-    payload: SyncPayload | None = None
+    payload: SyncRows | None = None
     error: str | None = None
     error_code: int | None = None
     terminal_lost: bool = False
